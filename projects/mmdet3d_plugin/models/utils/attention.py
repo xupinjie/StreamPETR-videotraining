@@ -18,7 +18,8 @@ from einops import rearrange
 from mmcv.runner import auto_fp16
 from mmcv.runner.base_module import BaseModule
 
-from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+#from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 
@@ -71,7 +72,8 @@ class FlashAttention(nn.Module):
                                     device=q.device)
             cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
                                     device=kv.device)                    
-            output = flash_attn_unpadded_kvpacked_func(
+            #output = flash_attn_unpadded_kvpacked_func(
+            output = flash_attn_varlen_kvpacked_func(
                 q, kv, cu_seqlens_q, cu_seqlens_k, max_sq, max_sk,
                 self.dropout_p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
