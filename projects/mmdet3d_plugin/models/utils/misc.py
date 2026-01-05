@@ -4,6 +4,32 @@ import numpy as np
 from mmdet.core import bbox_xyxy_to_cxcywh
 from mmdet.models.utils.transformer import inverse_sigmoid
 
+class NvtxRangePush(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, msg="None"):
+        torch.cuda.nvtx.range_push(msg)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_in):
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        return grad_in, None
+
+class NvtxRangePop(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, msg="None"):
+        ctx.msg = msg
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_in):
+        msg = ctx.msg
+        torch.cuda.nvtx.range_push(msg)
+        return grad_in, None
+
 def memory_refresh(memory, prev_exist):
     memory_shape = memory.shape
     view_shape = [1 for _ in range(len(memory_shape))]

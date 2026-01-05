@@ -7,6 +7,7 @@ import copy
 import platform
 import random
 from functools import partial
+import multiprocessing
 
 import numpy as np
 from mmcv.parallel import collate
@@ -30,6 +31,7 @@ def build_dataloader(dataset,
                      shuffler_sampler=None,
                      nonshuffler_sampler=None,
                      runner_type=dict(type='EpochBasedRunner'),
+                     use_pin_memory=False,
                      **kwargs):
     """Build PyTorch DataLoader.
     In distributed training, each GPU/process has a dataloader.
@@ -111,8 +113,9 @@ def build_dataloader(dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=partial(collate, samples_per_gpu=samples_per_gpu),
-        pin_memory=False,
+        pin_memory=use_pin_memory,
         worker_init_fn=init_fn,
+        multiprocessing_context=multiprocessing.get_context("spawn") if num_workers > 0 else None,
         **kwargs)
 
     return data_loader

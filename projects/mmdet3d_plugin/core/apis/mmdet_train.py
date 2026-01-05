@@ -12,10 +12,11 @@ import warnings
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.cuda.nvtx as nvtx
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
                          Fp16OptimizerHook, OptimizerHook, build_optimizer,
-                         build_runner, get_dist_info)
+                         build_runner, get_dist_info, Hook)
 from mmcv.utils import build_from_cfg
 
 from mmdet.core import EvalHook
@@ -37,6 +38,8 @@ def custom_train_detector(model,
                    eval_model=None,
                    meta=None):
     logger = get_root_logger(cfg.log_level)
+
+    use_pin_memory = cfg.get('use_pin_memory', False)
 
     # prepare data loaders
    
@@ -64,10 +67,12 @@ def custom_train_detector(model,
             # cfg.gpus will be ignored if distributed
             len(cfg.gpu_ids),
             dist=distributed,
+            # shuffle=False,
             seed=cfg.seed,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
             runner_type=cfg.runner,
+            use_pin_memory=use_pin_memory,
         ) for ds in dataset
     ]
 
@@ -147,6 +152,75 @@ def custom_train_detector(model,
                                    cfg.checkpoint_config, cfg.log_config,
                                    cfg.get('momentum_config', None))
     
+    # Add NVTX hooks for training
+    class NVTXHook(Hook):
+        def __init__(self):
+            self.current_range = None
+
+        def before_run(self, runner):
+            # Initialize NVTX ranges
+            if self.current_range is not None:
+                nvtx.range_pop()
+            self.current_range = None
+            nvtx.range_push("Training")
+            self.current_range = "Training"
+
+        def before_train_iter(self, runner):
+            if self.current_range is not None:
+                nvtx.range_pop()  # Pop any existing range
+            nvtx.range_push("DataLoader")
+            self.current_range = "DataLoader"
+            return None
+
+        def after_train_iter(self, runner):
+            if self.current_range == "DataLoader":
+                nvtx.range_pop()
+                self.current_range = None
+
+        def before_forward(self, runner):
+            if self.current_range is not None:
+                nvtx.range_pop()  # Pop any existing range
+            nvtx.range_push("Forward")
+            self.current_range = "Forward"
+            return None
+
+        def after_forward(self, runner):
+            if self.current_range == "Forward":
+                nvtx.range_pop()
+                self.current_range = None
+
+        def before_backward(self, runner):
+            if self.current_range is not None:
+                nvtx.range_pop()  # Pop any existing range
+            nvtx.range_push("Backward")
+            self.current_range = "Backward"
+            return None
+
+        def after_backward(self, runner):
+            if self.current_range == "Backward":
+                nvtx.range_pop()
+                self.current_range = None
+
+        def before_optimize(self, runner):
+            if self.current_range is not None:
+                nvtx.range_pop()  # Pop any existing range
+            nvtx.range_push("Optimize")
+            self.current_range = "Optimize"
+            return None
+
+        def after_optimize(self, runner):
+            if self.current_range == "Optimize":
+                nvtx.range_pop()
+                self.current_range = None
+
+        def after_run(self, runner):
+            # Clean up any remaining ranges
+            if self.current_range is not None:
+                nvtx.range_pop()
+                self.current_range = None
+
+    runner.register_hook(NVTXHook())
+    
     # register profiler hook
     #trace_config = dict(type='tb_trace', dir_name='work_dir')
     #profiler_config = dict(on_trace_ready=trace_config)
@@ -175,12 +249,13 @@ def custom_train_detector(model,
             shuffle=False,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+            use_pin_memory=use_pin_memory,
         )
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
         eval_cfg['jsonfile_prefix'] = osp.join('val', cfg.work_dir, time.ctime().replace(' ','_').replace(':','_'))
         eval_hook = CustomDistEvalHook if distributed else EvalHook
-        runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
+        runner.register_hook(eval_hook(val_dataloader, **eval_cfg), priority="LOW")
 
     # user-defined hooks
     if cfg.get('custom_hooks', None):

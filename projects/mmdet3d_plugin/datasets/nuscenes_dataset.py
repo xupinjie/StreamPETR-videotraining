@@ -191,6 +191,8 @@ class CustomNuScenesDataset(NuScenesDataset):
 
         if self.modality['use_camera']:
             image_paths = []
+            video_paths = []
+            video_frame_ids = []
             lidar2img_rts = []
             intrinsics = []
             extrinsics = []
@@ -198,6 +200,9 @@ class CustomNuScenesDataset(NuScenesDataset):
             for cam_type, cam_info in info['cams'].items():
                 img_timestamp.append(cam_info['timestamp'] / 1e6)
                 image_paths.append(cam_info['data_path'])
+                if "video_path" in cam_info.keys():
+                    video_paths.append(cam_info["video_path"])
+                    video_frame_ids.append(cam_info["video_frame_id"])
                 # obtain lidar to image transformation matrix
                 cam2lidar_r = cam_info['sensor2lidar_rotation']
                 cam2lidar_t = cam_info['sensor2lidar_translation']
@@ -225,6 +230,8 @@ class CustomNuScenesDataset(NuScenesDataset):
                     intrinsics=intrinsics,
                     extrinsics=extrinsics,
                     prev_exists=prev_exists,
+                    video_paths=video_paths if len(video_paths) > 0 else None,
+                    video_frame_ids=video_frame_ids if len(video_frame_ids) > 0 else None,
                 ))
         if not self.test_mode:
             annos = self.get_ann_info(index)

@@ -18,8 +18,8 @@ class_names = [
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 
-num_gpus = 8
-batch_size = 2
+num_gpus = 1
+batch_size = 16
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
 num_epochs = 24
 
@@ -248,6 +248,10 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
     )
+
+log_config = dict(
+    interval=1,
+    hooks=[dict(type='TextLoggerHook')])
 
 evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
 find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False

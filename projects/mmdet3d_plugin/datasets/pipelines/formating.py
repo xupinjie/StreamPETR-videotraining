@@ -11,6 +11,8 @@ from mmdet3d.core.points import BasePoints
 from mmdet.datasets.pipelines import to_tensor
 from mmdet3d.datasets.pipelines import DefaultFormatBundle
 
+import nvtx
+
 @PIPELINES.register_module()
 class PETRFormatBundle3D(DefaultFormatBundle):
     """Default formatting bundle.
@@ -33,6 +35,8 @@ class PETRFormatBundle3D(DefaultFormatBundle):
         self.with_gt = with_gt
         self.with_label = with_label
         self.collect_keys = collect_keys
+    
+    @nvtx.annotate("PETRFormatBundle3D", color="green")
     def __call__(self, results):
         """Call function to transform and format common fields in results.
 
@@ -102,6 +106,16 @@ class PETRFormatBundle3D(DefaultFormatBundle):
                         for n in results['gt_names_3d']
                     ],
                                                        dtype=np.int64)
+        
+        # Handle GOP data if present (for GPU decode pipeline)
+        # GOP data cannot be stacked (different sizes), so wrap with stack=False
+        if 'GOP' in results:
+            results['GOP'] = DC(results['GOP'], stack=False, cpu_only=True)
+        if 'video_paths' in results:
+            results['video_paths'] = DC(results['video_paths'], stack=False, cpu_only=True)
+        if 'video_frame_ids' in results:
+            results['video_frame_ids'] = DC(results['video_frame_ids'], stack=False, cpu_only=True)
+        
         results = super(PETRFormatBundle3D, self).__call__(results)
         return results
 

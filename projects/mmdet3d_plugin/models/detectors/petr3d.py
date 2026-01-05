@@ -10,12 +10,20 @@
 #  Modified by Shihao Wang
 # ------------------------------------------------------------------------
 import torch
+import numpy as np
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.models.utils.misc import locations
+from projects.mmdet3d_plugin.models.utils.misc import NvtxRangePush, NvtxRangePop
+import os
+import torch.nn.functional as F
+
+import nvtx
+
+import accvlab.on_demand_video_decoder as nvc
 
 @DETECTORS.register_module()
 class Petr3D(MVXTwoStageDetector):
@@ -43,7 +51,13 @@ class Petr3D(MVXTwoStageDetector):
                  position_level=0,
                  aux_2d_only=True,
                  single_test=False,
-                 pretrained=None):
+                 pretrained=None,
+                 enable_gop_decode=False,
+                 enable_transform=False,
+                 img_norm_cfg=None,
+                 ida_aug_conf=None,
+                 batch_size=0,
+                 num_cameras=0):
         super(Petr3D, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
                              img_backbone, pts_backbone, img_neck, pts_neck,
@@ -60,7 +74,498 @@ class Petr3D(MVXTwoStageDetector):
         self.position_level = position_level
         self.aux_2d_only = aux_2d_only
         self.test_flag = False
+        self.iter = 0
+        
+        # GOP decoder initialization
+        self.enable_gop_decode = enable_gop_decode
+        self.enable_transform = enable_transform
+        self.img_norm_cfg = img_norm_cfg
+        self.ida_aug_conf = ida_aug_conf
+        self._gop_decoder = None
+        self.batch_size = batch_size
+        self.num_cameras = num_cameras
 
+    def _init_gop_decoder(self):
+        """Lazy initialization of GOP decoder"""
+        if self._gop_decoder is None and self.enable_gop_decode:
+            # Initialize GOP decoder using nvc.CreateGopDecoder
+            self._gop_decoder = nvc.CreateGopDecoder(
+                maxfiles=self.batch_size*self.num_cameras,
+                iGpu=int(os.environ.get("LOCAL_RANK", 0)),
+            )
+            self._gop_decoder_initialized = True
+            print(f"GOP decoder initialized on GPU {os.environ.get('LOCAL_RANK', 0)}")
+    
+    @nvtx.annotate("decode_gop_batch", color="red")
+    def _decode_gop_batch(self, gop_data_list, video_paths_list, video_frame_ids_list, to_float32=True):
+        """
+        Decode GOP data on GPU in batch.
+        
+        Args:
+            gop_data_list: List[List[np.ndarray]] - batch of GOP data, each item is a list of GOP arrays for cameras
+            video_paths_list: List[List[str]] - batch of video paths
+            video_frame_ids_list: List[List[int]] - batch of frame IDs
+            to_float32: bool - whether to convert to float32
+        
+        Returns:
+            torch.Tensor: Decoded images in shape (B, T, N, C, H, W) or (B, N, C, H, W)
+        """
+        self._init_gop_decoder()
+        
+        H, W, C = self.ida_aug_conf["H"], self.ida_aug_conf["W"], 3
+        batch_size = len(gop_data_list)
+        if (batch_size != self.batch_size):
+            raise ValueError(f"data {batch_size} != self.batch_size {self.batch_size}")
+        
+        # Check if gop_data_list has time dimension
+        # gop_data_list could be:
+        # 1. List[List[np.ndarray]] - (B, N) where N is num_cameras
+        # 2. List[List[List[np.ndarray]]] - (B, T, N) where T is temporal frames
+        
+        if batch_size > 0 and len(gop_data_list[0]) > 0:
+            if isinstance(gop_data_list[0][0], list):
+                raise ValueError("gop_data_list should be a list of lists of np.ndarrays, and not support T dimension Now")
+        
+        decoded_images = []
+
+        # Single frame case: (B, N) - but we need to add time dimension for consistency
+        gops_all = []
+        paths_all = []
+        frame_ids_all = []
+        
+        for b in range(batch_size):
+            gops_all.extend(gop_data_list[b])  # Extend with N cameras
+            paths_all.extend(video_paths_list[b])
+            frame_ids_all.extend(video_frame_ids_list[b])
+        
+        # Decode all at once: (B*N) images
+        # print("gops_all: ", type(gops_all), len(gops_all), type(gops_all[0]), len(gops_all[0]))
+        try:
+            decoded_frames = self._gop_decoder.DecodeFromGOPListRGB(
+                gops_all, paths_all, frame_ids_all, True  # RGB format
+            )
+            
+            if decoded_frames is None or len(decoded_frames) != len(gops_all):
+                raise RuntimeError(f"GOP decode failed or returned wrong number of frames")
+            
+            # Convert to tensors
+            imgs = []
+            for decoded_frame in decoded_frames:
+                # img_tensor = torch.from_numpy(frame).permute(2, 0, 1)  # (C, H, W)
+                img_tensor = torch.tensor(decoded_frame, dtype=torch.uint8).to(torch.cuda.current_device())
+                if to_float32:
+                    img_tensor = img_tensor.float()
+                imgs.append(img_tensor)
+            
+            imgs = torch.stack(imgs)  # (B*N, C, H, W)
+            # Reshape to (B, N, C, H, W)
+            N = len(gop_data_list[0])
+            decoded_images = imgs.reshape(batch_size, N, C, H, W)
+            
+            # Add time dimension: (B, N, C, H, W) -> (B, 1, N, C, H, W)
+            decoded_images = decoded_images.unsqueeze(1)
+            
+        except Exception as e:
+            print(f"ERROR in GOP decode: {e}")
+            # Fallback: generate random with time dimension
+            N = len(gop_data_list[0])
+            decoded_images = torch.randint(0, 256, (batch_size, 1, N, C, H, W),
+                                            dtype=torch.float32 if to_float32 else torch.uint8)
+    
+        # # Move to current device
+        # device = next(self.parameters()).device
+        # decoded_images = decoded_images.to(device)
+        
+        return decoded_images
+    
+    @nvtx.annotate("resize_crop_flip_gpu_batch", color="cyan")
+    def _resize_crop_flip_gpu_batch(self, img, ida_aug_conf, training=True, ida_aug_params=None):
+        """
+        Apply resize, crop, flip transforms on GPU in batch.
+        
+        Args:
+            img: torch.Tensor - (B, T, N, C, H, W) or (B, N, C, H, W)
+            ida_aug_conf: dict - augmentation config
+            training: bool - whether in training mode
+            ida_aug_params: dict - Pre-sampled augmentation parameters (from PrepareGPUImageAug Pipeline),
+                           containing resize, resize_dims, crop, flip, rotate.
+                           If provided, these parameters are used instead of re-sampling.
+        
+        Returns:
+            img: torch.Tensor - transformed images
+            ida_mats: torch.Tensor - transformation matrices (B, T, N, 3, 3) or (B, N, 3, 3)
+        """
+        # Check dimensions
+        has_time_dim = (img.dim() == 6)  # (B, T, N, C, H, W)
+        
+        if has_time_dim:
+            B, T, N, C, H, W = img.shape
+            # Flatten to (B*T*N, C, H, W)
+            img = img.reshape(B * T * N, C, H, W)
+        else:
+            B, N, C, H, W = img.shape
+            T = 1
+            # Flatten to (B*N, C, H, W)
+            img = img.reshape(B * N, C, H, W)
+        
+        fH, fW = ida_aug_conf["final_dim"]
+        orig_H, orig_W = ida_aug_conf["H"], ida_aug_conf["W"]
+        
+        # Use pre-sampled parameters or sample new ones
+        if ida_aug_params is not None:
+            # Use pre-sampled parameters from Pipeline (stored in img_metas)
+            # These are Python native types, no conversion needed
+            resize = ida_aug_params['resize']
+            resize_dims = ida_aug_params['resize_dims']
+            crop = ida_aug_params['crop']
+            flip = ida_aug_params['flip']
+            rotate = ida_aug_params['rotate']
+        elif training:
+            # Random sampling in training mode (backward compatible)
+            resize = np.random.uniform(*ida_aug_conf["resize_lim"])
+            resize_dims = (int(orig_W * resize), int(orig_H * resize))
+            newW, newH = resize_dims
+            crop_h = int((1 - np.random.uniform(*ida_aug_conf["bot_pct_lim"])) * newH) - fH
+            crop_w = int(np.random.uniform(0, max(0, newW - fW)))
+            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            flip = False
+            if ida_aug_conf.get("rand_flip", False) and np.random.choice([0, 1]):
+                flip = True
+            rotate = np.random.uniform(*ida_aug_conf.get("rot_lim", (0.0, 0.0)))
+        else:
+            # Use fixed parameters in test mode
+            resize = max(fH / orig_H, fW / orig_W)
+            resize_dims = (int(orig_W * resize), int(orig_H * resize))
+            newW, newH = resize_dims
+            crop_h = int((1 - np.mean(ida_aug_conf["bot_pct_lim"])) * newH) - fH
+            crop_w = int(max(0, newW - fW) / 2)
+            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            flip = False
+            rotate = 0.0
+        
+        # 1. Resize
+        img = F.interpolate(
+            img, 
+            size=(resize_dims[1], resize_dims[0]),  # (height, width)
+            mode='bilinear',
+            align_corners=False
+        )
+        
+        # 2. Crop
+        x1, y1, x2, y2 = crop
+        _, _, H_resized, W_resized = img.shape
+        x1_clamped = max(0, min(x1, W_resized))
+        x2_clamped = max(0, min(x2, W_resized))
+        y1_clamped = max(0, min(y1, H_resized))
+        y2_clamped = max(0, min(y2, H_resized))
+        img = img[:, :, y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+        
+        # Ensure exact final dimensions
+        img = F.interpolate(img, size=(fH, fW), mode='bilinear', align_corners=False)
+        
+        # 3. Flip
+        if flip:
+            img = torch.flip(img, dims=[3])  # Flip width dimension
+        
+        # 4. Rotation (if needed, currently disabled in config)
+        # Note: rotation would require more complex implementation
+        
+        # Compute transformation matrix (ida_mat)
+        ida_rot = torch.eye(2, device=img.device) * resize
+        ida_tran = torch.tensor([-crop[0], -crop[1]], device=img.device, dtype=torch.float32)
+        
+        if flip:
+            A = torch.tensor([[-1, 0], [0, 1]], device=img.device, dtype=torch.float32)
+            b = torch.tensor([fW, 0], device=img.device, dtype=torch.float32)
+            ida_rot = A @ ida_rot
+            ida_tran = A @ ida_tran + b
+        
+        ida_mat = torch.eye(3, device=img.device, dtype=torch.float32)
+        ida_mat[:2, :2] = ida_rot
+        ida_mat[:2, 2] = ida_tran
+        
+        # Reshape back
+        if has_time_dim:
+            img = img.reshape(B, T, N, C, fH, fW)
+            ida_mats = ida_mat.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(B, T, N, 3, 3)
+        else:
+            img = img.reshape(B, N, C, fH, fW)
+            ida_mats = ida_mat.unsqueeze(0).unsqueeze(0).expand(B, N, 3, 3)
+        
+        return img, ida_mats
+    
+    @nvtx.annotate("normalize_gpu_batch", color="cyan")
+    def _normalize_gpu_batch(self, img, mean, std, to_rgb=True):
+        """
+        Normalize images on GPU in batch.
+        
+        Args:
+            img: torch.Tensor - (B, T, N, C, H, W) or (B, N, C, H, W)
+            mean: list/tuple - mean values for each channel
+            std: list/tuple - std values for each channel
+            to_rgb: bool - whether to convert BGR to RGB (already RGB from decoder)
+        
+        Returns:
+            img: torch.Tensor - normalized images
+        """
+        has_time_dim = (img.dim() == 6)
+        
+        # Convert mean and std to tensors
+        mean = torch.tensor(mean, device=img.device, dtype=img.dtype)
+        std = torch.tensor(std, device=img.device, dtype=img.dtype)
+        
+        if has_time_dim:
+            # (B, T, N, C, H, W)
+            mean = mean.view(1, 1, 1, -1, 1, 1)
+            std = std.view(1, 1, 1, -1, 1, 1)
+        else:
+            # (B, N, C, H, W)
+            mean = mean.view(1, 1, -1, 1, 1)
+            std = std.view(1, 1, -1, 1, 1)
+        
+        # Normalize: (img - mean) / std
+        img = (img - mean) / std
+        
+        return img
+    
+    @nvtx.annotate("pad_gpu_batch", color="cyan")
+    def _pad_gpu_batch(self, img, size_divisor=32):
+        """
+        Pad images to be divisible by size_divisor on GPU.
+        
+        Args:
+            img: torch.Tensor - (B, T, N, C, H, W) or (B, N, C, H, W)
+            size_divisor: int - pad to be divisible by this value
+        
+        Returns:
+            img: torch.Tensor - padded images
+            pad_shape: tuple - (pad_H, pad_W, C) for metadata update
+        """
+        has_time_dim = (img.dim() == 6)
+        
+        if has_time_dim:
+            B, T, N, C, H, W = img.shape
+        else:
+            B, N, C, H, W = img.shape
+        
+        # Calculate padding
+        pad_H = int(np.ceil(H / size_divisor)) * size_divisor
+        pad_W = int(np.ceil(W / size_divisor)) * size_divisor
+        
+        if pad_H == H and pad_W == W:
+            # No padding needed, but still return shape for metadata
+            return img, (pad_H, pad_W, C)
+        
+        # Calculate padding amounts (left, right, top, bottom)
+        pad_h = pad_H - H
+        pad_w = pad_W - W
+        padding = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+        
+        # Reshape for padding
+        if has_time_dim:
+            img = img.reshape(B * T * N, C, H, W)
+        else:
+            img = img.reshape(B * N, C, H, W)
+        
+        # Pad
+        img = F.pad(img, padding, mode='constant', value=0)
+        
+        # Reshape back
+        if has_time_dim:
+            img = img.reshape(B, T, N, C, pad_H, pad_W)
+        else:
+            img = img.reshape(B, N, C, pad_H, pad_W)
+        
+        return img, (pad_H, pad_W, C)
+    
+    @nvtx.annotate("apply_global_transform", color="cyan")
+    def _apply_global_transform(self, data, rot_range, scale_ratio_range, translation_std, reverse_angle, training=True):
+        """
+        Apply global rotation, scale, translation transforms (CPU matrix operations).
+        This updates lidar2img, ego_pose matrices.
+        
+        Args:
+            data: dict - data dictionary containing transforms
+            rot_range: tuple - rotation range
+            scale_ratio_range: tuple - scale ratio range
+            translation_std: list - translation std
+            reverse_angle: bool - whether to reverse rotation angle
+            training: bool - whether in training mode
+        
+        Returns:
+            None (modifies data in place)
+        """
+        if not training:
+            return
+        
+        # Sample augmentation parameters
+        rot_angle = np.random.uniform(*rot_range)
+        scale_ratio = np.random.uniform(*scale_ratio_range)
+        trans = np.random.normal(scale=np.array(translation_std, dtype=np.float32), size=3)
+        
+        # Get batch size
+        if 'lidar2img' in data:
+            batch_size = len(data['lidar2img'])
+        else:
+            return
+        
+        # Process each sample in batch
+        for b in range(batch_size):
+            # Rotation matrix
+            rot_cos = np.cos(rot_angle)
+            rot_sin = np.sin(rot_angle)
+            rot_mat = np.array([
+                [rot_cos, rot_sin, 0, 0],
+                [-rot_sin, rot_cos, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ], dtype=np.float32)
+            rot_mat_inv = np.linalg.inv(rot_mat)
+            
+            # Scale matrix
+            scale_mat = np.array([
+                [scale_ratio, 0, 0, 0],
+                [0, scale_ratio, 0, 0],
+                [0, 0, scale_ratio, 0],
+                [0, 0, 0, 1]
+            ], dtype=np.float32)
+            scale_mat_inv = np.linalg.inv(scale_mat)
+            
+            # Translation matrix
+            trans_mat = np.eye(4, dtype=np.float32)
+            trans_mat[:3, 3] = trans
+            trans_mat_inv = np.linalg.inv(trans_mat)
+            
+            # Apply to ego_pose
+            if 'ego_pose' in data and isinstance(data['ego_pose'], list):
+                ego_pose = np.array(data['ego_pose'][b], dtype=np.float32)
+                ego_pose = ego_pose @ rot_mat_inv @ scale_mat_inv @ trans_mat_inv
+                data['ego_pose'][b] = ego_pose
+            
+            if 'ego_pose_inv' in data and isinstance(data['ego_pose_inv'], list):
+                ego_pose_inv = np.array(data['ego_pose_inv'][b], dtype=np.float32)
+                ego_pose_inv = trans_mat @ scale_mat @ rot_mat @ ego_pose_inv
+                data['ego_pose_inv'][b] = ego_pose_inv
+            
+            # Apply to lidar2img
+            if 'lidar2img' in data and isinstance(data['lidar2img'], list):
+                num_views = len(data['lidar2img'][b])
+                for v in range(num_views):
+                    lidar2img = np.array(data['lidar2img'][b][v], dtype=np.float32)
+                    lidar2img = lidar2img @ rot_mat_inv @ scale_mat_inv @ trans_mat_inv
+                    data['lidar2img'][b][v] = lidar2img
+            
+            # Apply to gt_bboxes_3d
+            if 'gt_bboxes_3d' in data and isinstance(data['gt_bboxes_3d'], list):
+                # Note: gt_bboxes_3d rotation/scale/translation should be handled by framework
+                # This is just a placeholder - actual implementation depends on bbox format
+                pass
+    
+    @nvtx.annotate("apply_gpu_transforms", color="orange")
+    def _apply_gpu_transforms(self, img, data, ida_aug_conf, img_norm_cfg, 
+                             global_rot_range, global_scale_range, global_trans_std,
+                             reverse_angle=True, training=True):
+        """
+        Apply all GPU transforms to decoded images.
+        
+        Args:
+            img: torch.Tensor - decoded images (B, T, N, C, H, W) or (B, N, C, H, W)
+            data: dict - data dictionary containing img_metas and ida_aug_params
+            ida_aug_conf: dict - image augmentation config
+            img_norm_cfg: dict - normalization config
+            global_rot_range: tuple - global rotation range
+            global_scale_range: tuple - global scale range
+            global_trans_std: list - global translation std
+            reverse_angle: bool - reverse rotation angle for global transform
+            training: bool - training mode
+        
+        Returns:
+            img: torch.Tensor - transformed images
+        """
+        # Extract pre-sampled augmentation parameters from img_metas (if exists)
+        # ida_aug_params is stored in img_metas to avoid collate issues
+        ida_aug_params = None
+        if 'img_metas' in data:
+            img_metas = data['img_metas']
+            # img_metas is a list of dicts (one per sample), take the first one
+            if isinstance(img_metas, list) and len(img_metas) > 0:
+                first_meta = img_metas[0]
+                # For temporal training, first_meta might be a list of metas
+                if isinstance(first_meta, list) and len(first_meta) > 0:
+                    first_meta = first_meta[0]
+                ida_aug_params = first_meta.get('ida_aug_params', None)
+        
+        # 1. Resize, Crop, Flip, Rotate
+        img, ida_mats = self._resize_crop_flip_gpu_batch(img, ida_aug_conf, training, ida_aug_params)
+        
+        # After resize/crop, update img_shape in img_metas
+        has_time_dim = (img.dim() == 6)
+        if has_time_dim:
+            B, T, N, C, H, W = img.shape
+        else:
+            B, N, C, H, W = img.shape
+        
+        # Update img_shape for each sample after resize/crop
+        if 'img_metas' in data:
+            img_metas = data['img_metas']
+            for batch_idx in range(len(img_metas)):
+                # img_metas might be nested for temporal data
+                if isinstance(img_metas[batch_idx], list):
+                    # Temporal case: img_metas[batch_idx] is a list of T metas
+                    for t_idx in range(len(img_metas[batch_idx])):
+                        meta = img_metas[batch_idx][t_idx]
+                        # Update to current shape after resize/crop
+                        meta['img_shape'] = [(H, W, C)] * N
+                else:
+                    # Non-temporal case
+                    meta = img_metas[batch_idx]
+                    meta['img_shape'] = [(H, W, C)] * N
+        
+        # 2. Normalize
+        img = self._normalize_gpu_batch(
+            img, 
+            mean=img_norm_cfg['mean'], 
+            std=img_norm_cfg['std'],
+            to_rgb=img_norm_cfg.get('to_rgb', True)
+        )
+        
+        # 3. Pad
+        img, pad_shape = self._pad_gpu_batch(img, size_divisor=32)
+        
+        # Update pad_shape in img_metas after padding
+        if 'img_metas' in data:
+            img_metas = data['img_metas']
+            for batch_idx in range(len(img_metas)):
+                if isinstance(img_metas[batch_idx], list):
+                    # Temporal case
+                    for t_idx in range(len(img_metas[batch_idx])):
+                        meta = img_metas[batch_idx][t_idx]
+                        # Update to padded shape
+                        meta['pad_shape'] = [pad_shape] * N
+                        # img_shape should also reflect the final padded shape
+                        meta['img_shape'] = [pad_shape] * N
+                else:
+                    # Non-temporal case
+                    meta = img_metas[batch_idx]
+                    meta['pad_shape'] = [pad_shape] * N
+                    meta['img_shape'] = [pad_shape] * N
+        
+        # 4. Global transform (CPU matrix operations)
+        # If PrepareGPUImageAug Pipeline is used, global transform is already done in pipeline, skip
+        if ida_aug_params is None:
+            self._apply_global_transform(
+                data, 
+                rot_range=global_rot_range,
+                scale_ratio_range=global_scale_range,
+                translation_std=global_trans_std,
+                reverse_angle=reverse_angle,
+                training=training
+            )
+        
+        # Note: ida_mats could be stored in data for downstream use if needed
+        # data['ida_mats'] = ida_mats
+        
+        return img
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
         """Extract features of images."""
@@ -211,6 +716,89 @@ class Petr3D(MVXTwoStageDetector):
         list[list[dict]]), with the outer list indicating test time
         augmentations.
         """
+        if self.enable_gop_decode and 'GOP' not in data:
+            raise ValueError("'GOP' is required in data, for enable_gop_decode")
+        if self.enable_gop_decode and data['GOP'] is None:
+            raise ValueError("data['GOP'] can not be None, for enable_gop_decode")
+
+        # Handle GOP decoding if GOP data is present
+        if self.enable_gop_decode:
+            with nvtx.annotate("gop_decode_and_transform", color="purple"):
+                # Extract GOP-related data from DataContainer if needed
+                from mmcv.parallel import DataContainer as DC
+                
+                if isinstance(data['GOP'], DC):
+                    gop_data_list = data['GOP'].data
+                else:
+                    gop_data_list = data['GOP']
+                
+                # Extract video paths and frame IDs (should also be in data)
+                if 'video_paths' in data:
+                    video_paths_list = data['video_paths'].data if isinstance(data['video_paths'], DC) else data['video_paths']
+                else:
+                    # Fallback: extract from img_metas
+                    if 'img_metas' in data:
+                        img_metas = data['img_metas']
+                        if isinstance(img_metas, DC):
+                            img_metas = img_metas.data
+                        video_paths_list = [meta.get('filename', []) for meta in img_metas]
+                    else:
+                        video_paths_list = [[]] * len(gop_data_list)
+                
+                if 'video_frame_ids' in data:
+                    video_frame_ids_list = data['video_frame_ids'].data if isinstance(data['video_frame_ids'], DC) else data['video_frame_ids']
+                else:
+                    # Fallback: extract from img_metas or use empty
+                    video_frame_ids_list = [[]] * len(gop_data_list)
+                
+                # 1. Decode GOP to images on GPU
+                decoded_img = self._decode_gop_batch(
+                    gop_data_list, 
+                    video_paths_list, 
+                    video_frame_ids_list, 
+                    to_float32=True
+                )
+                # print(f"[GOP Decode] Decoded batch: img shape = {decoded_img.shape}")
+
+        if self.enable_gop_decode or self.enable_transform:
+                # 2. Apply GPU transforms (resize, crop, flip, normalize, pad)
+                # Get augmentation configs from model config or use defaults
+                
+                if not self.enable_gop_decode:
+                    input_img = data['img'].to(torch.float32)
+                else:
+                    input_img = decoded_img
+
+                # Apply all transforms
+                transformed_img = self._apply_gpu_transforms(
+                    input_img,
+                    data,
+                    ida_aug_conf=self.ida_aug_conf,
+                    img_norm_cfg=self.img_norm_cfg,
+                    global_rot_range=[-0.3925, 0.3925],
+                    global_scale_range=[0.95, 1.05],
+                    global_trans_std=[0, 0, 0],
+                    reverse_angle=True,
+                    training=return_loss
+                )
+                # print(f"[GOP Transform] Transformed img shape = {transformed_img.shape}")
+                
+                # Replace 'img' in data with transformed images
+                data['img'] = transformed_img
+                
+                # NOTE: No need to update img_metas here!
+                # Worker (LoadMultiViewImageFromGOP) already set the correct final shapes
+                # based on final_dim parameter. This is cleaner - worker handles metadata,
+                # model handles image processing.
+                
+                # Remove GOP-related keys as they're no longer needed
+                data.pop('GOP', None)
+                data.pop('video_paths', None)
+                data.pop('video_frame_ids', None)
+        
+        # print("data['img'].shape: ", data['img'].shape)
+
+        # Continue with normal forward logic
         if return_loss:
             for key in ['gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'img_metas']:
                 data[key] = list(zip(*data[key]))
