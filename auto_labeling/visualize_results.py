@@ -12,6 +12,8 @@ import argparse
 import cv2
 import numpy as np
 from typing import List, Dict, Any, Tuple
+from pyquaternion import Quaternion
+from nuscenes.utils.data_classes import Box
 
 
 # nuScenes class names and colors
@@ -121,7 +123,7 @@ def get_lidar2img_from_info(info: Dict) -> List[np.ndarray]:
 
 def get_3d_box_corners(detection: Dict) -> np.ndarray:
     """
-    Get 8 corner coordinates of 3D bbox
+    Get 8 corner coordinates of 3D bbox using nuscenes Box class
     
     Note: The z coordinate from model output is the bottom center (not geometric center)
     
@@ -132,28 +134,26 @@ def get_3d_box_corners(detection: Dict) -> np.ndarray:
         corners: shape (3, 8) - 3D coordinates of 8 corners
     """
     x, y, z = detection['translation']
-    w, l, h = detection['size']
+    # Model output: [x_size, y_size, z_size] 
+    # nuScenes Box expects: [width, length, height] = [y_size, x_size, z_size]
+    x_size, y_size, z_size = detection['size']
     yaw = detection['rotation_yaw']
     
-    # Half size (xy direction)
-    dx, dy = l/2, w/2
+    # Convert yaw to quaternion (rotation around z-axis)
+    # nuScenes uses quaternion format [w, x, y, z]
+    quaternion = Quaternion(axis=[0, 0, 1], angle=yaw)
     
-    # 8 corners (unrotated)
-    # z is bottom center, so bottom z=0, top z=h
-    corners = np.array([
-        [ dx,  dy, 0], [ dx, -dy, 0], [-dx, -dy, 0], [-dx,  dy, 0],  # Bottom
-        [ dx,  dy, h], [ dx, -dy, h], [-dx, -dy, h], [-dx,  dy, h]   # Top
-    ]).T
+    # nuScenes Box expects size in [width, length, height] format
+    # where width is y-direction, length is x-direction
+    wlh = [y_size, x_size, z_size]
     
-    # Rotation
-    cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-    rot = np.array([[cos_yaw, -sin_yaw, 0], [sin_yaw, cos_yaw, 0], [0, 0, 1]])
-    corners = rot @ corners
+    # The model outputs z as bottom center, but nuScenes Box uses geometric center
+    # So we need to adjust z to be the geometric center: z_center = z_bottom + h/2
+    center = [x, y, z + z_size / 2]
     
-    # Translation (z is bottom center)
-    corners[0, :] += x
-    corners[1, :] += y
-    corners[2, :] += z
+    # Create nuScenes Box and get corners
+    box = Box(center=center, size=wlh, orientation=quaternion)
+    corners = box.corners()  # Returns (3, 8) array
     
     return corners
 
