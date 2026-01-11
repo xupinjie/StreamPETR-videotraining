@@ -879,17 +879,48 @@ class Petr3D(MVXTwoStageDetector):
         return self.simple_test(img_metas[0], **data)
 
     def simple_test_pts(self, img_metas, **data):
-        """Test function of point cloud branch."""
+        """
+        Test function of point cloud branch.
+        
+        Supports two modes for temporal state management:
+        1. Single video mode (legacy): Automatically detect scene changes using
+           scene_token and reset memory accordingly. All samples in batch are
+           assumed to be from the same video.
+        2. Multi-video mode: If 'prev_exists' is passed in data, use it directly
+           for per-sample temporal control. prev_exists should be shape (B,)
+           where each element indicates if the corresponding sample has previous
+           temporal context (1.0) or is starting fresh (0.0).
+        """
         location = self.prepare_location(img_metas, **data)
         outs_roi = self.forward_roi_head(location, **data)
         topk_indexes = outs_roi['topk_indexes']
 
-        if img_metas[0]['scene_token'] != self.prev_scene_token:
-            self.prev_scene_token = img_metas[0]['scene_token']
-            data['prev_exists'] = data['img'].new_zeros(1)
-            self.pts_bbox_head.reset_memory()
+        # Check if prev_exists is provided externally (multi-video mode)
+        if 'prev_exists' in data and data['prev_exists'] is not None:
+            # Multi-video parallel mode: use provided prev_exists
+            # prev_exists should be shape (B,) for per-sample control
+            prev_exists = data['prev_exists']
+            if prev_exists.dim() == 0:
+                prev_exists = prev_exists.unsqueeze(0)
+            
+            # If any sample needs reset (prev_exists=0), we need to handle memory
+            # The memory refresh in pts_bbox_head.pre_update_memory handles this
+            # per-sample using the prev_exists mask
+            if prev_exists.shape[0] == 1 and len(img_metas) > 1:
+                # Broadcast single value to batch size
+                prev_exists = prev_exists.expand(len(img_metas))
+            data['prev_exists'] = prev_exists
         else:
-            data['prev_exists'] = data['img'].new_ones(1)
+            # Legacy single video mode: auto-detect scene changes
+            if img_metas[0]['scene_token'] != self.prev_scene_token:
+                self.prev_scene_token = img_metas[0]['scene_token']
+                # Create prev_exists with shape (B,) for batch support
+                batch_size = len(img_metas)
+                data['prev_exists'] = data['img'].new_zeros(batch_size)
+                self.pts_bbox_head.reset_memory()
+            else:
+                batch_size = len(img_metas)
+                data['prev_exists'] = data['img'].new_ones(batch_size)
 
         outs = self.pts_bbox_head(location, img_metas, topk_indexes, **data)
         bbox_list = self.pts_bbox_head.get_bboxes(

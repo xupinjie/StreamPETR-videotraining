@@ -46,7 +46,7 @@ def parse_args():
                         default='auto_labeling_results/detection_results.json',
                         help='Path to detection results JSON file')
     parser.add_argument('--pkl-path', type=str,
-                        default='/data/nuscenes-mini/stream_petr/nuscenes2d_temporal_infos_val.pkl',
+                        default='/data/nuscenes-mini/stream_petr/nuscenes2d_temporal_infos_train.pkl',
                         help='Path to data pkl file for lidar2img matrices')
     parser.add_argument('--output-dir', type=str,
                         default='auto_labeling_results/visualizations',

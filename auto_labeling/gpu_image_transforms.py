@@ -87,17 +87,23 @@ class GPUImageTransforms:
         """
         Execute all image transforms on GPU.
         
+        Note: This method does NOT update metadata (intrinsics/lidar2img).
+        For batch processing, metadata should be updated separately per sample
+        using _update_metadata() after splitting the batch results.
+        
         Args:
             images: Multi-view image list. Can be either:
                     - List[np.ndarray]: CPU numpy arrays, shape (H, W, 3), BGR format
                     - List[torch.Tensor]: GPU tensors, shape (H, W, 3), BGR format
                     When GPU tensors are provided, zero-copy is achieved.
+                    Can be any number of images (single sample or batch of samples).
             metadata: dict containing intrinsics, extrinsics, etc.
+                     Only used for compatibility, not modified in this method.
         
         Returns:
             Tuple[torch.Tensor, dict]: 
                 - Transformed image tensor, shape (N, C, H, W), on GPU
-                - Updated metadata
+                - Original metadata (unchanged, update separately using _update_metadata)
         """
         with torch.cuda.nvtx.range("GPU_Preprocess"):
             # 1. Convert to GPU tensor (handles both numpy and tensor inputs)
@@ -119,11 +125,9 @@ class GPUImageTransforms:
             # 5. Pad
             with torch.cuda.nvtx.range("GPU_Pad"):
                 imgs = self._pad(imgs)
-            
-            # 6. Update metadata
-            with torch.cuda.nvtx.range("GPU_Update_Meta"):
-                metadata = self._update_metadata(metadata, len(images))
         
+        # Note: metadata update is now done externally per sample
+        # to support batch processing across multiple samples
         return imgs, metadata
     
     def _to_gpu_tensor(self, images: Union[List[np.ndarray], List[torch.Tensor]]) -> torch.Tensor:

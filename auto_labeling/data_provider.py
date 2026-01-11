@@ -7,6 +7,7 @@ from typing import Dict, Any, Union
 
 from .data_provider_base import BaseDataProvider
 from .data_provider_image import ImageDataProvider
+from .data_provider_image_torchvision import TorchvisionDataProvider
 from .data_provider_video_cv2 import OpenCVVideoDataProvider
 from .data_provider_video_stream import VideoDataProviderACCVStream
 from .data_provider_video_stream_async import VideoDataProviderACCVStreamAsync
@@ -30,6 +31,7 @@ def create_data_provider(
     
     Supported modes:
         - 'image': Load images from image files using cv2.imread
+        - 'torchvision_image': Load images using torchvision.io with parallel I/O
         - 'opencv_video': Decode video frames using OpenCV VideoCapture (CPU)
         - 'nvc_video': Decode video frames using NVC GPU decoder (sync)
         - 'nvc_video_async': Decode video frames using NVC GPU decoder with async prefetch
@@ -43,6 +45,8 @@ def create_data_provider(
         gpu_preprocess: Whether to use GPU for image preprocessing
         device: GPU device (only used when gpu_preprocess=True)
         **kwargs: Additional arguments passed to specific provider class.
+                  For 'torchvision_image' mode:
+                      - num_workers: Number of parallel workers (default 6)
                   For 'opencv_video' mode:
                       - video_base_path: Base path for video files
                       - max_cache_size: Max VideoCapture cache size
@@ -98,7 +102,16 @@ def create_data_provider(
     }
     
     if mode == 'image':
+        # ImageDataProvider uses simple serial loading, no extra args needed
         return ImageDataProvider(**common_args)
+    
+    elif mode == 'torchvision_image':
+        # Extract torchvision-specific arguments
+        tv_args = {
+            'num_workers': kwargs.get('num_workers', 6),
+            'batch_size': kwargs.get('batch_size', 1),
+        }
+        return TorchvisionDataProvider(**common_args, **tv_args)
     
     elif mode == 'opencv_video':
         # Extract video-specific arguments
@@ -125,7 +138,7 @@ def create_data_provider(
         return VideoDataProviderACCVStreamAsync(**common_args, **nvc_args)
     
     else:
-        available_modes = ['image', 'opencv_video', 'nvc_video', 'nvc_video_async']
+        available_modes = ['image', 'torchvision_image', 'opencv_video', 'nvc_video', 'nvc_video_async']
         raise ValueError(
             f"Unknown data provider mode: '{mode}'. "
             f"Available modes: {available_modes}"
@@ -140,7 +153,8 @@ DataProvider = ImageDataProvider
 # Re-export classes for direct import
 __all__ = [
     'BaseDataProvider',
-    'ImageDataProvider', 
+    'ImageDataProvider',
+    'TorchvisionDataProvider',
     'OpenCVVideoDataProvider',
     'VideoDataProviderACCVStream',
     'VideoDataProviderACCVStreamAsync',

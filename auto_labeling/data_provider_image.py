@@ -5,17 +5,27 @@
 
 import cv2
 import numpy as np
+import torch
 from typing import List, Dict, Any
 
 from .data_provider_base import BaseDataProvider
+from .batch_utils import (
+    update_metadata_for_transform,
+    build_img_metas,
+    build_sample,
+    collate_samples,
+    images_to_tensor,
+)
 
 
 class ImageDataProvider(BaseDataProvider):
     """
-    Data provider that loads images from image files.
+    Data provider that loads images from image files using cv2.imread.
     
-    Uses cv2.imread() to read images from disk.
-    This is the traditional approach for loading data from image files.
+    Simple serial implementation - serves as reference implementation.
+    For high-performance image loading, use TorchvisionDataProvider instead.
+    
+    Note: cv2.imread does NOT release GIL, so parallel loading has limited benefit.
     """
     
     def __init__(
@@ -32,7 +42,7 @@ class ImageDataProvider(BaseDataProvider):
         
         Args:
             pkl_path: Path to the data index pkl file
-            data_root: Root directory of the data (used as prefix for relative paths)
+            data_root: Root directory of the data
             img_norm_cfg: Image normalization configuration
             ida_aug_conf: Image augmentation configuration
             gpu_preprocess: Whether to use GPU for image preprocessing
@@ -47,33 +57,83 @@ class ImageDataProvider(BaseDataProvider):
             device=device,
         )
     
-    def load_images(self, data_info: Dict[str, Any]) -> List[np.ndarray]:
+    def _load_images(self, metadata: Dict[str, Any]) -> List[np.ndarray]:
         """
-        Load multi-view images from image files using cv2.imread.
+        Load multi-view images from image files.
         
         Args:
-            data_info: Metadata dictionary returned by get_data_info()
-                       Uses 'img_filename' field for image paths
-        
+            metadata: Sample metadata with 'img_filename' field
+            
         Returns:
             List of images, BGR format, np.ndarray with dtype float32
-        
-        Raises:
-            FileNotFoundError: If an image file cannot be loaded
         """
         images = []
-        filenames = data_info['img_filename']
-        
-        for filename in filenames:
-            # Handle relative path by prepending data_root
-            if not filename.startswith('/'):
-                filename = f"{self.data_root}/{filename}"
-            
-            img = cv2.imread(filename)
+        for filename in metadata['img_filename']:
+            path = self.data_index.get_full_path(filename)
+            img = cv2.imread(path)
             if img is None:
-                raise FileNotFoundError(f"Cannot load image: {filename}")
-            
+                raise FileNotFoundError(f"Cannot load image: {path}")
             images.append(img.astype(np.float32))
-        
         return images
-
+    
+    def get_batch(self, indices: List[int]) -> Dict[str, Any]:
+        """
+        Get a batch of samples with serial loading.
+        
+        Implements simple serial loading and per-sample processing.
+        Each sample is loaded and transformed independently.
+        
+        Args:
+            indices: List of sample indices
+            
+        Returns:
+            Batch dictionary
+        """
+        samples = []
+        pad_shape = self.transforms.get_pad_shape()
+        
+        for idx in indices:
+            with torch.cuda.nvtx.range("Process_Sample"):
+                # 1. Get metadata
+                with torch.cuda.nvtx.range("Get_Metadata"):
+                    metadata = self.data_index.get_data_info(idx)
+                
+                # 2. Load images
+                with torch.cuda.nvtx.range("Load_Images"):
+                    images = self._load_images(metadata)
+                
+                # 3. Transform
+                with torch.cuda.nvtx.range("Transform"):
+                    if self.gpu_preprocess:
+                        # Convert to GPU tensors
+                        gpu_images = [
+                            torch.from_numpy(img).to(self.device, non_blocking=True)
+                            for img in images
+                        ]
+                        img_tensor, _ = self.transforms(gpu_images, metadata)
+                    else:
+                        images, _ = self.transforms(images, metadata)
+                        img_tensor = images_to_tensor(images)
+                
+                # 4. Update metadata for transform
+                with torch.cuda.nvtx.range("Update_Metadata"):
+                    updated_meta = update_metadata_for_transform(
+                        metadata,
+                        resize=self.transforms.resize,
+                        crop_h=self.transforms.crop_h,
+                        crop_w=self.transforms.crop_w,
+                        final_dim=self.transforms.final_dim,
+                    )
+                
+                # 5. Build sample
+                num_views = img_tensor.shape[0]
+                img_metas = build_img_metas(
+                    updated_meta, pad_shape, self.img_norm_cfg, 
+                    self.ida_aug_conf, num_views
+                )
+                sample = build_sample(img_tensor, updated_meta, img_metas)
+                samples.append(sample)
+        
+        # 6. Collate
+        with torch.cuda.nvtx.range("Collate"):
+            return collate_samples(samples)

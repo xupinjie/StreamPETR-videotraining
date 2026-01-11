@@ -46,6 +46,12 @@ class ImageTransforms:
         fH, fW = self.final_dim
         H, W = self.original_H, self.original_W
         self.resize = max(fH / H, fW / W)  # Ensure output size is at least final_dim
+        
+        # Pre-compute crop parameters (same as resize_crop method)
+        newW, newH = int(W * self.resize), int(H * self.resize)
+        bot_pct = np.mean(self.bot_pct_lim)
+        self.crop_h = int((1 - bot_pct) * newH) - fH
+        self.crop_w = int(max(0, newW - fW) / 2)
     
     def __call__(self, images: List[np.ndarray], metadata: Dict[str, Any]) -> Tuple[List[np.ndarray], Dict[str, Any]]:
         """

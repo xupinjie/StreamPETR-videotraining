@@ -59,6 +59,8 @@ class OpenCVVideoDataProvider(BaseDataProvider):
             ida_aug_conf=ida_aug_conf,
             gpu_preprocess=gpu_preprocess,
             device=device,
+            num_workers=max_cache_size,  # Use max_cache_size as num_workers
+            batch_size=1,  # Video providers typically use per-sample loading
         )
         
         self.video_base_path = video_base_path if video_base_path else data_root
