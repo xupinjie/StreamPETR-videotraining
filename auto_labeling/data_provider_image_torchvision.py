@@ -5,9 +5,17 @@
 
 import numpy as np
 import torch
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any
 
 from .data_provider_base import BaseDataProvider
+from .batch_utils import (
+    update_metadata_for_transform,
+    build_img_metas,
+    build_sample,
+    collate_samples,
+    images_to_tensor,
+)
 
 # Import torchvision for image loading
 try:
@@ -26,10 +34,11 @@ class TorchvisionDataProvider(BaseDataProvider):
     during image reading, allowing true parallel I/O and decoding when
     combined with ThreadPoolExecutor.
     
-    Benefits over cv2.imread:
+    Key features:
         - Uses libjpeg-turbo (2-4x faster JPEG decoding)
         - Releases GIL during read, enabling true parallelism
-        - Can load directly to GPU tensor (zero-copy path available)
+        - Parallel loading across all samples in batch (batch_size * num_cameras)
+        - Single GPU preprocessing call for all images in batch
     
     Requirements:
         - torchvision >= 0.8.0 (for torchvision.io.read_image)
@@ -51,16 +60,15 @@ class TorchvisionDataProvider(BaseDataProvider):
         
         Args:
             pkl_path: Path to the data index pkl file
-            data_root: Root directory of the data (used as prefix for relative paths)
+            data_root: Root directory of the data
             img_norm_cfg: Image normalization configuration
             ida_aug_conf: Image augmentation configuration
             gpu_preprocess: Whether to use GPU for image preprocessing
             device: GPU device (only used when gpu_preprocess=True)
             num_workers: Number of parallel workers for image loading per sample.
                         Default is 6 (one per camera for nuScenes).
-                        Total workers = num_workers * batch_size for batch loading.
-            batch_size: Expected batch size. Used to scale thread pool for
-                       optimal parallel loading. Total threads = num_workers * batch_size.
+            batch_size: Expected batch size. Used to scale thread pool.
+                       Total threads = num_workers * batch_size.
         """
         if not TORCHVISION_AVAILABLE:
             raise ImportError(
@@ -75,30 +83,30 @@ class TorchvisionDataProvider(BaseDataProvider):
             ida_aug_conf=ida_aug_conf,
             gpu_preprocess=gpu_preprocess,
             device=device,
-            num_workers=num_workers,
-            batch_size=batch_size,
         )
         
-        print(f"TorchvisionDataProvider initialized with ThreadPool "
-              f"({num_workers * batch_size} workers = "
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        
+        # Thread pool for parallel image loading
+        total_workers = num_workers * batch_size
+        self._thread_pool = ThreadPoolExecutor(max_workers=total_workers)
+        
+        print(f"TorchvisionDataProvider initialized: "
+              f"ThreadPool({total_workers} workers = "
               f"batch_size={batch_size} x num_workers={num_workers})")
     
-    def load_single_image(self, filepath: str) -> np.ndarray:
+    def _load_image_cpu(self, filepath: str) -> np.ndarray:
         """
         Load a single image using torchvision and return as numpy array.
         
-        This method is designed to be called in parallel via ThreadPoolExecutor.
-        torchvision.io.read_image releases GIL during execution, enabling true
-        parallel I/O and JPEG decoding across multiple threads.
+        Releases GIL during execution, enabling true parallel I/O and decoding.
         
         Args:
             filepath: Full path to the image file
             
         Returns:
             Image as numpy array, BGR format, dtype float32, shape (H, W, 3)
-            
-        Raises:
-            FileNotFoundError: If the image file cannot be loaded
         """
         try:
             # read_image returns tensor in (C, H, W) format, RGB order
@@ -115,12 +123,11 @@ class TorchvisionDataProvider(BaseDataProvider):
         except Exception as e:
             raise FileNotFoundError(f"Cannot load image: {filepath}. Error: {e}")
     
-    def load_single_image_to_gpu(self, filepath: str) -> torch.Tensor:
+    def _load_image_gpu(self, filepath: str) -> torch.Tensor:
         """
         Load a single image and return as GPU tensor.
         
-        This method overrides the base class implementation to provide
-        optimized loading with direct GPU transfer using torchvision.
+        Releases GIL during execution, enabling true parallel I/O and decoding.
         
         Args:
             filepath: Full path to the image file
@@ -153,55 +160,120 @@ class TorchvisionDataProvider(BaseDataProvider):
                 device=self.device
             )
     
-    def load_images(self, data_info: Dict[str, Any]) -> List[np.ndarray]:
+    def get_batch(self, indices: List[int]) -> Dict[str, Any]:
         """
-        Load multi-view images using torchvision with parallel I/O.
+        Get a batch with parallel loading and batch GPU preprocessing.
         
-        This method is kept for backward compatibility and direct usage.
-        The optimized get_batch() in BaseDataProvider uses load_single_image()
-        with ThreadPoolExecutor for parallel loading.
+        Optimized data flow:
+        1. Batch metadata collection
+        2. Parallel image loading (batch_size * num_cameras images)
+        3. Single GPU preprocessing call (one kernel launch for all images)
+        4. Split and assemble results
         
         Args:
-            data_info: Metadata dictionary returned by get_data_info()
-                       Uses 'img_filename' field for image paths
-        
+            indices: List of sample indices
+            
         Returns:
-            List of images, BGR format, np.ndarray with dtype float32
+            Batch dictionary
         """
-        filenames = data_info['img_filename']
-        full_paths = [self._get_full_path(f) for f in filenames]
+        # Step 1: Collect all metadata
+        with torch.cuda.nvtx.range("Get_All_Metadata"):
+            all_metadata = self.data_index.get_batch_data_info(indices)
         
-        # Use thread pool for parallel loading
-        images = list(self._thread_pool.map(self.load_single_image, full_paths))
-        return images
+        # Step 2: Collect all image paths
+        all_paths = []
+        path_counts = []
+        for metadata in all_metadata:
+            filenames = metadata['img_filename']
+            paths = [self.data_index.get_full_path(f) for f in filenames]
+            all_paths.extend(paths)
+            path_counts.append(len(paths))
+        
+        # Step 3: Parallel load ALL images (batch_size * num_cameras)
+        with torch.cuda.nvtx.range("Parallel_Load_All_Images"):
+            if self.gpu_preprocess:
+                all_images = list(self._thread_pool.map(self._load_image_gpu, all_paths))
+            else:
+                all_images = list(self._thread_pool.map(self._load_image_cpu, all_paths))
+        
+        # Step 4: Batch transform
+        with torch.cuda.nvtx.range("Batch_Transform"):
+            if self.gpu_preprocess:
+                # GPU mode: Transform ALL images at once (single kernel launch)
+                with torch.cuda.nvtx.range("GPU_Transform_All"):
+                    all_transformed, _ = self.transforms(all_images, all_metadata[0])
+                    # all_transformed shape: (total_images, C, H, W)
+                
+                # Split and build samples
+                all_img_tensors = []
+                all_updated_metadata = []
+                
+                img_idx = 0
+                for i, metadata in enumerate(all_metadata):
+                    num_imgs = path_counts[i]
+                    sample_tensor = all_transformed[img_idx:img_idx + num_imgs]
+                    img_idx += num_imgs
+                    
+                    updated_meta = update_metadata_for_transform(
+                        metadata,
+                        resize=self.transforms.resize,
+                        crop_h=self.transforms.crop_h,
+                        crop_w=self.transforms.crop_w,
+                        final_dim=self.transforms.final_dim,
+                    )
+                    all_img_tensors.append(sample_tensor)
+                    all_updated_metadata.append(updated_meta)
+            else:
+                # CPU mode: Transform per sample
+                all_img_tensors = []
+                all_updated_metadata = []
+                
+                img_idx = 0
+                for i, metadata in enumerate(all_metadata):
+                    num_imgs = path_counts[i]
+                    sample_images = all_images[img_idx:img_idx + num_imgs]
+                    img_idx += num_imgs
+                    
+                    images, _ = self.transforms(sample_images, metadata)
+                    img_tensor = images_to_tensor(images)
+                    
+                    updated_meta = update_metadata_for_transform(
+                        metadata,
+                        resize=self.transforms.resize,
+                        crop_h=self.transforms.crop_h,
+                        crop_w=self.transforms.crop_w,
+                        final_dim=self.transforms.final_dim,
+                    )
+                    all_img_tensors.append(img_tensor)
+                    all_updated_metadata.append(updated_meta)
+        
+        # Step 5: Build samples
+        with torch.cuda.nvtx.range("Build_Samples"):
+            pad_shape = self.transforms.get_pad_shape()
+            samples = []
+            
+            for img_tensor, metadata in zip(all_img_tensors, all_updated_metadata):
+                num_views = img_tensor.shape[0]
+                img_metas = build_img_metas(
+                    metadata, pad_shape, self.img_norm_cfg,
+                    self.ida_aug_conf, num_views
+                )
+                sample = build_sample(img_tensor, metadata, img_metas)
+                samples.append(sample)
+        
+        # Step 6: Collate
+        with torch.cuda.nvtx.range("Collate"):
+            return collate_samples(samples)
     
-    def load_images_to_gpu(self, data_info: Dict[str, Any]) -> List[torch.Tensor]:
-        """
-        Load multi-view images directly to GPU tensors with parallel I/O.
-        
-        This method is kept for backward compatibility and direct usage.
-        The optimized get_batch() in BaseDataProvider uses load_single_image_to_gpu()
-        with ThreadPoolExecutor for parallel loading.
-        
-        Args:
-            data_info: Metadata dictionary returned by get_data_info()
-                       Uses 'img_filename' field for image paths
-        
-        Returns:
-            List of GPU tensors, BGR format, shape (H, W, 3), dtype float32
-        """
-        filenames = data_info['img_filename']
-        full_paths = [self._get_full_path(f) for f in filenames]
-        
-        # Use thread pool for parallel loading to GPU
-        gpu_images = list(self._thread_pool.map(self.load_single_image_to_gpu, full_paths))
-        return gpu_images
+    def __del__(self):
+        """Clean up thread pool on deletion."""
+        if hasattr(self, '_thread_pool'):
+            self._thread_pool.shutdown(wait=False)
     
     def __repr__(self) -> str:
         """Return a string representation of the provider."""
         return (
             f"{self.__class__.__name__}("
-            f"data_root={self.data_root}, "
             f"num_workers={self.num_workers}, "
             f"batch_size={self.batch_size}, "
             f"gpu_preprocess={self.gpu_preprocess})"
