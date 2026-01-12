@@ -142,6 +142,27 @@ class BaseDataProvider(ABC):
         
         return self._sampler.advance_frame()
     
+    def prefetch_next_batch(self) -> bool:
+        """
+        Prefetch the next batch for async providers.
+        
+        This is a no-op for non-async providers.
+        Async providers should override this method.
+        
+        Returns:
+            True if prefetch was initiated, False otherwise
+        """
+        return False
+    
+    def supports_prefetch(self) -> bool:
+        """
+        Check if this provider supports async prefetching.
+        
+        Returns:
+            True if prefetch is supported
+        """
+        return False
+    
     # =========================================================================
     # Convenience methods
     # =========================================================================

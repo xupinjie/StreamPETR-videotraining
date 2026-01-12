@@ -101,7 +101,7 @@ def parse_args():
                         help='Use GPU for image preprocessing (resize, normalize, pad)')
     
     # Data loading mode arguments
-    parser.add_argument('--data-mode', type=str, default='image',
+    parser.add_argument('--data-mode', type=str, default='nvc_video_async',
                         choices=['image', 'torchvision_image', 'opencv_video', 'nvc_video', 'nvc_video_async'],
                         help='Data loading mode: "image" for loading from image files, '
                              '"torchvision_image" for parallel image loading using torchvision.io, '
@@ -235,6 +235,9 @@ def run_multi_video_inference(args, data_provider, engine):
             print(f"\n  Round {round_idx + 1}/{sampler.total_rounds}: "
                   f"{active_videos} active videos, max {max_frames} frames")
             
+            # Check if async prefetch is supported
+            supports_prefetch = data_provider.supports_prefetch()
+            
             # Process all frames in this round
             frame_idx = 0
             while True:
@@ -242,6 +245,11 @@ def run_multi_video_inference(args, data_provider, engine):
                     t_data_start = time.time()
                     batch_data, is_first_frame = data_provider.get_multi_video_batch()
                     t_data_end = time.time()
+                
+                # Start prefetch for next batch (non-blocking, overlaps with inference)
+                if supports_prefetch:
+                    with torch.cuda.nvtx.range("Prefetch_Next_Batch"):
+                        data_provider.prefetch_next_batch()
                 
                 with torch.cuda.nvtx.range("Multi_Video_Inference_Step"):
                     t_infer_start = time.time()
@@ -414,6 +422,7 @@ def main():
         elif args.data_mode in ['nvc_video', 'nvc_video_async']:
             provider_kwargs['video_base_path'] = args.video_base_path
             provider_kwargs['num_cameras'] = args.num_cameras
+            provider_kwargs['batch_size'] = args.batch_size
         
         data_provider = create_data_provider(**provider_kwargs)
     

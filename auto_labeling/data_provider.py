@@ -126,6 +126,7 @@ def create_data_provider(
         nvc_args = {
             'video_base_path': kwargs.get('video_base_path'),
             'num_cameras': kwargs.get('num_cameras', 6),
+            'batch_size': kwargs.get('batch_size', 1),
         }
         return VideoDataProviderACCVStream(**common_args, **nvc_args)
     
@@ -134,6 +135,7 @@ def create_data_provider(
         nvc_args = {
             'video_base_path': kwargs.get('video_base_path'),
             'num_cameras': kwargs.get('num_cameras', 6),
+            'batch_size': kwargs.get('batch_size', 1),
         }
         return VideoDataProviderACCVStreamAsync(**common_args, **nvc_args)
     

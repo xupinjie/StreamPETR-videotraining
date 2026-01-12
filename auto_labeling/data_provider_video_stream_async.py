@@ -1,14 +1,19 @@
 # ------------------------------------------------------------------------
 # Auto Labeling Inference Framework
-# VideoDataProviderACCVStreamAsync - Async video decoder with prefetching
+# VideoDataProviderACCVStreamAsync - Async video decoder with batch prefetching
 # ------------------------------------------------------------------------
 
 import os
-import numpy as np
 import torch
 from typing import List, Dict, Any, Optional
 
 from .data_provider_base import BaseDataProvider
+from .batch_utils import (
+    update_metadata_for_transform,
+    build_img_metas,
+    build_sample,
+    collate_samples,
+)
 
 # Import NVC video decoder library
 try:
@@ -20,28 +25,32 @@ except ImportError:
 
 class VideoDataProviderACCVStreamAsync(BaseDataProvider):
     """
-    Async video data provider with prefetching capability.
+    Async video data provider with batch prefetching capability.
     
     Uses accvlab.on_demand_video_decoder library for GPU-accelerated async
-    video decoding. While processing sample N, asynchronously prefetches
-    sample N+1 to overlap decode and compute operations for higher throughput.
+    video decoding. While processing batch N, asynchronously prefetches
+    batch N+1 to overlap decode and compute operations for higher throughput.
     
     Key Features:
-        - Async decoding: DecodeN12ToRGBAsync starts decoding without blocking
-        - Prefetching: Next sample is decoded while current sample is processed
-        - Zero-copy: Decoded frames stay on GPU (with mandatory deep copy before next prefetch)
+        - Batch decoding: All frames (bs * num_cameras) decoded in one call
+        - Async prefetch: Next batch is decoded while current batch is processed
+        - Zero-copy: Decoded frames stay on GPU
+    
+    Usage Pattern:
+        for i, batch_indices in enumerate(all_batches):
+            # Prefetch next batch (non-blocking)
+            if i + 1 < len(all_batches):
+                provider.prefetch_batch(all_batches[i + 1])
+            
+            # Get current batch (uses prefetched data if available)
+            batch = provider.get_batch(batch_indices)
+            
+            # Process batch...
     
     Requirements:
         - accvlab.on_demand_video_decoder library must be installed
         - CUDA-capable GPU
         - gpu_preprocess=True recommended for full zero-copy benefit
-    
-    Prefetch Flow:
-        Sample 0: [Sync decode] → [Deep copy] → [Prefetch sample 1]
-        Sample 1: [Get prefetched] → [Deep copy] → [Prefetch sample 2]
-        Sample 2: [Get prefetched] → [Deep copy] → [Prefetch sample 3]
-        ...
-        Sample N-1: [Get prefetched] → [Deep copy] → [No prefetch, last sample]
     """
     
     def __init__(
@@ -52,6 +61,7 @@ class VideoDataProviderACCVStreamAsync(BaseDataProvider):
         ida_aug_conf: Dict[str, Any],
         video_base_path: Optional[str] = None,
         num_cameras: int = 6,
+        batch_size: int = 1,
         gpu_preprocess: bool = False,
         device: str = 'cuda:0',
     ):
@@ -64,9 +74,9 @@ class VideoDataProviderACCVStreamAsync(BaseDataProvider):
             img_norm_cfg: Image normalization configuration
             ida_aug_conf: Image augmentation configuration
             video_base_path: Base path for video files. If None, uses data_root.
-            num_cameras: Number of cameras (used for decoder initialization).
+            num_cameras: Number of cameras per sample. Default is 6 for nuScenes.
+            batch_size: Batch size for inference. Used for decoder initialization.
             gpu_preprocess: Whether to use GPU for image preprocessing.
-                           Recommended True for full async benefit.
             device: GPU device for decoding and preprocessing
         """
         if not NVC_AVAILABLE:
@@ -82,15 +92,11 @@ class VideoDataProviderACCVStreamAsync(BaseDataProvider):
             ida_aug_conf=ida_aug_conf,
             gpu_preprocess=gpu_preprocess,
             device=device,
-            num_workers=num_cameras,  # Use num_cameras as num_workers
-            batch_size=1,  # Video providers typically use per-sample loading
         )
         
         self.video_base_path = video_base_path if video_base_path else data_root
         self.num_cameras = num_cameras
-        
-        # NVC async decoder (lazy initialization)
-        self._nvc_decoder = None
+        self.batch_size = batch_size
         
         # Parse GPU ID from device string
         if device.startswith('cuda:'):
@@ -100,29 +106,32 @@ class VideoDataProviderACCVStreamAsync(BaseDataProvider):
         else:
             self._gpu_id = 0
         
-        # Prefetch state management
+        # NVC async decoder (lazy initialization)
+        self._nvc_decoder = None
+        
+        # Prefetch state for batch-level async decoding
         self._prefetch_state = {
-            'pending': False,           # Is there a pending prefetch?
-            'index': None,              # Index of prefetched sample
-            'video_paths': None,        # Prefetched video paths (absolute)
-            'frame_ids': None,          # Prefetched frame IDs
+            'pending': False,
+            'indices': None,           # Tuple of indices for comparison
+            'all_paths': None,         # Flattened absolute paths
+            'all_frame_ids': None,     # Flattened frame IDs
+            'image_counts': None,      # Images per sample
+            'all_metadata': None,      # Metadata list
         }
     
     def _lazy_init_decoder(self):
         """
         Lazy initialization of the NVC async decoder.
         
-        Creates the decoder on first use to avoid initialization overhead
-        when the provider is created but not yet used.
+        Initializes decoder with capacity for batch_size * num_cameras files.
         """
         if self._nvc_decoder is None:
             with torch.cuda.nvtx.range("NVC_Async_Decoder_Init"):
-                # Use LOCAL_RANK if available (for distributed training)
                 gpu_id = int(os.environ.get("LOCAL_RANK", self._gpu_id))
                 
                 self._nvc_decoder = nvc.CreateSampleReader(
                     num_of_set=1,
-                    num_of_file=self.num_cameras,
+                    num_of_file=self.batch_size * self.num_cameras,
                     iGpu=gpu_id,
                 )
     
@@ -145,280 +154,273 @@ class VideoDataProviderACCVStreamAsync(BaseDataProvider):
             abs_paths.append(os.path.abspath(abs_path))
         return abs_paths
     
-    def _start_prefetch(self, index: int):
+    def _collect_batch_info(self, indices: List[int]):
         """
-        Start async prefetch for the given sample index.
-        
-        This method initiates asynchronous decoding for the next sample
-        without blocking. The decoded frames can be retrieved later using
-        DecodeN12ToRGBAsyncGetBuffer.
+        Collect all video paths and frame IDs for a batch.
         
         Args:
-            index: Sample index to prefetch
+            indices: List of sample indices
+            
+        Returns:
+            Tuple of (all_metadata, all_paths, all_frame_ids, image_counts)
         """
-        # Boundary check: don't prefetch beyond dataset
-        if index >= len(self):
-            self._prefetch_state['pending'] = False
-            return
+        all_metadata = []
+        all_paths = []
+        all_frame_ids = []
+        image_counts = []
         
-        with torch.cuda.nvtx.range("Async_Start_Prefetch"):
+        for idx in indices:
+            metadata = self.data_index.get_data_info(idx)
+            all_metadata.append(metadata)
+            
+            video_paths = metadata.get('video_paths')
+            video_frame_ids = metadata.get('video_frame_ids')
+            
+            if video_paths is None or video_frame_ids is None:
+                raise ValueError(f"video_paths and video_frame_ids required for sample {idx}")
+            
+            all_paths.extend(video_paths)
+            all_frame_ids.extend(video_frame_ids)
+            image_counts.append(len(video_paths))
+        
+        abs_paths = self._build_absolute_paths(all_paths)
+        return all_metadata, abs_paths, all_frame_ids, image_counts
+    
+    def prefetch_batch(self, indices: List[int]):
+        """
+        Start async prefetch for the given batch indices.
+        
+        This method initiates asynchronous decoding for the next batch
+        without blocking. Call this before get_batch() of current batch
+        to overlap decode with compute.
+        
+        Args:
+            indices: List of sample indices to prefetch
+        """
+        self._lazy_init_decoder()
+        
+        with torch.cuda.nvtx.range("Async_Prefetch_Start"):
             try:
-                # Get metadata for the sample to prefetch
-                metadata = self.get_data_info(index)
-                video_paths = metadata.get('video_paths')
-                frame_ids = metadata.get('video_frame_ids')
+                all_metadata, abs_paths, all_frame_ids, image_counts = \
+                    self._collect_batch_info(indices)
                 
-                if video_paths is None or frame_ids is None:
-                    print(f"WARNING: Cannot prefetch index {index}: missing video_paths or frame_ids")
-                    self._prefetch_state['pending'] = False
-                    return
-                
-                # Build absolute paths
-                abs_video_paths = self._build_absolute_paths(video_paths)
-                
-                # Start async decode
+                # Start async decode (non-blocking)
                 self._nvc_decoder.DecodeN12ToRGBAsync(
-                    abs_video_paths,
-                    frame_ids,
-                    True  # BGR format
+                    abs_paths,
+                    all_frame_ids,
+                    True  # RGB format
                 )
                 
                 # Update prefetch state
                 self._prefetch_state = {
                     'pending': True,
-                    'index': index,
-                    'video_paths': abs_video_paths,
-                    'frame_ids': frame_ids,
+                    'indices': tuple(indices),
+                    'all_paths': abs_paths,
+                    'all_frame_ids': all_frame_ids,
+                    'image_counts': image_counts,
+                    'all_metadata': all_metadata,
                 }
                 
             except Exception as e:
-                print(f"WARNING: Failed to start prefetch for index {index}: {e}")
+                print(f"WARNING: Failed to start prefetch: {e}")
                 self._prefetch_state['pending'] = False
-    
-    def _get_decoded_frames(self, video_paths: List[str], frame_ids: List[int]) -> List:
-        """
-        Get decoded frames from the async decoder.
-        
-        If frames are already prefetched, retrieves them from buffer.
-        Otherwise, starts sync decode and waits for completion.
-        
-        Args:
-            video_paths: List of absolute video paths
-            frame_ids: List of frame indices
-            
-        Returns:
-            List of decoded frames (GPU tensors)
-        """
-        # Check if current request matches pending prefetch
-        if (self._prefetch_state['pending'] and 
-            self._prefetch_state['video_paths'] == video_paths and
-            self._prefetch_state['frame_ids'] == frame_ids):
-            
-            # Prefetch hit: get frames from buffer
-            with torch.cuda.nvtx.range("Async_Get_Prefetched"):
-                decoded_frames = self._nvc_decoder.DecodeN12ToRGBAsyncGetBuffer(
-                    video_paths,
-                    frame_ids,
-                    True  # BGR format
-                )
-                self._prefetch_state['pending'] = False
-                return decoded_frames
-        else:
-            # Prefetch miss or first sample: do sync decode
-            # This happens when:
-            # 1. index=0 (first sample, no prefetch yet)
-            # 2. Random access (non-sequential iteration)
-            # 3. Prefetch failed
-            with torch.cuda.nvtx.range("Async_Sync_Decode"):
-                # Start async decode
-                self._nvc_decoder.DecodeN12ToRGBAsync(
-                    video_paths,
-                    frame_ids,
-                    True  # BGR format
-                )
-                # Immediately get result (blocks until decode complete)
-                decoded_frames = self._nvc_decoder.DecodeN12ToRGBAsyncGetBuffer(
-                    video_paths,
-                    frame_ids,
-                    True  # BGR format
-                )
-                self._prefetch_state['pending'] = False
-                return decoded_frames
-    
-    def load_images(self, data_info: Dict[str, Any]) -> List[np.ndarray]:
-        """
-        Load multi-view images by decoding video frames (CPU path).
-        
-        This method is used when gpu_preprocess=False.
-        Note: For best performance, use gpu_preprocess=True with load_images_to_gpu().
-        
-        Args:
-            data_info: Metadata dictionary from get_data_info()
-        
-        Returns:
-            List of images, BGR format, np.ndarray with dtype float32
-        """
-        with torch.cuda.nvtx.range("Async_Load_Images_CPU"):
-            video_paths = data_info.get('video_paths')
-            video_frame_ids = data_info.get('video_frame_ids')
-            
-            if video_paths is None or video_frame_ids is None:
-                raise ValueError(
-                    "video_paths and video_frame_ids are required. "
-                    "Make sure the pkl file contains video path information."
-                )
-            
-            self._lazy_init_decoder()
-            
-            H = self.ida_aug_conf.get('H', 900)
-            W = self.ida_aug_conf.get('W', 1600)
-            C = 3
-            
-            abs_video_paths = self._build_absolute_paths(video_paths)
-            
-            try:
-                decoded_frames = self._get_decoded_frames(abs_video_paths, video_frame_ids)
-                
-                # Convert to numpy (CPU path)
-                images = []
-                for frame in decoded_frames:
-                    tensor = torch.as_tensor(frame, device=f'cuda:{self._gpu_id}')
-                    # Deep copy and move to CPU
-                    np_frame = tensor.cpu().numpy().astype(np.float32)
-                    
-                    if np_frame.shape[0] != H or np_frame.shape[1] != W:
-                        print(f"WARNING: Frame shape mismatch: {np_frame.shape}")
-                    
-                    images.append(np_frame)
-                
-                return images
-                
-            except Exception as e:
-                print(f"ERROR: Async decode failed: {e}")
-                # Fallback to random images
-                images = []
-                for _ in video_paths:
-                    fallback = np.random.randint(0, 256, (H, W, C), dtype=np.uint8)
-                    images.append(fallback.astype(np.float32))
-                return images
-    
-    def load_images_to_gpu(self, data_info: Dict[str, Any]) -> List[torch.Tensor]:
-        """
-        Load multi-view images directly to GPU tensors with async prefetch.
-        
-        This method provides zero-copy loading with async prefetching.
-        Decoded frames are deep-copied before returning to allow the next
-        prefetch to reuse the decode buffer.
-        
-        IMPORTANT: Frames are deep-copied using torch.clone() because the
-        decode buffer will be overwritten by the next DecodeN12ToRGBAsync call.
-        
-        Args:
-            data_info: Metadata dictionary from get_data_info()
-        
-        Returns:
-            List of GPU tensors, BGR format, shape (H, W, 3), dtype float32
-        """
-        with torch.cuda.nvtx.range("Async_Load_Images_GPU"):
-            video_paths = data_info.get('video_paths')
-            video_frame_ids = data_info.get('video_frame_ids')
-            
-            if video_paths is None or video_frame_ids is None:
-                raise ValueError(
-                    "video_paths and video_frame_ids are required. "
-                    "Make sure the pkl file contains video path information."
-                )
-            
-            self._lazy_init_decoder()
-            
-            H = self.ida_aug_conf.get('H', 900)
-            W = self.ida_aug_conf.get('W', 1600)
-            C = 3
-            
-            abs_video_paths = self._build_absolute_paths(video_paths)
-            gpu_images = []
-            
-            try:
-                decoded_frames = self._get_decoded_frames(abs_video_paths, video_frame_ids)
-                
-                # IMPORTANT: Deep copy frames before next prefetch
-                # The decode buffer will be overwritten by DecodeN12ToRGBAsync
-                with torch.cuda.nvtx.range("Async_Deep_Copy"):
-                    for frame in decoded_frames:
-                        # torch.as_tensor provides zero-copy view
-                        # .clone() creates deep copy to preserve data
-                        tensor = torch.as_tensor(
-                            frame,
-                            device=f'cuda:{self._gpu_id}'
-                        ).to(torch.float32).clone()
-                        
-                        if tensor.shape[0] != H or tensor.shape[1] != W or tensor.shape[2] != C:
-                            print(f"WARNING: Frame shape mismatch: {tensor.shape}")
-                            tensor = torch.randint(
-                                0, 256, (H, W, C),
-                                dtype=torch.float32,
-                                device=f'cuda:{self._gpu_id}'
-                            )
-                        
-                        gpu_images.append(tensor)
-                
-            except Exception as e:
-                print(f"ERROR: Async decode failed: {e}")
-                # Fallback to random images
-                for _ in video_paths:
-                    fallback = torch.randint(
-                        0, 256, (H, W, C),
-                        dtype=torch.float32,
-                        device=f'cuda:{self._gpu_id}'
-                    )
-                    gpu_images.append(fallback)
-            
-            return gpu_images
-    
-    def get_single_sample(self, index: int) -> Dict[str, Any]:
-        """
-        Get complete data for a single sample with async prefetching.
-        
-        Overrides base class to add prefetch logic:
-        1. Load current sample (from prefetch or sync decode)
-        2. After loading, start prefetch for index+1
-        
-        Boundary handling:
-        - index=0: No prefetch available, does sync decode, then prefetches index=1
-        - index=N-1 (last): Gets prefetched data, no next prefetch
-        
-        Args:
-            index: Data index
-        
-        Returns:
-            Dictionary containing images and metadata
-        """
-        # Call base class implementation (which calls load_images or load_images_to_gpu)
-        result = super().get_single_sample(index)
-        
-        # Start prefetch for next sample (only in GPU mode for zero-copy benefit)
-        if self.gpu_preprocess:
-            next_index = index + 1
-            if next_index < len(self):
-                self._start_prefetch(next_index)
-        
-        return result
     
     def reset_prefetch_state(self):
         """
         Reset prefetch state.
         
-        Call this method when:
+        Call this when:
         - Starting a new iteration from the beginning
         - Switching to random access pattern
-        - After scene changes that invalidate prefetch
+        - After scene changes
         """
         self._prefetch_state = {
             'pending': False,
-            'index': None,
-            'video_paths': None,
-            'frame_ids': None,
+            'indices': None,
+            'all_paths': None,
+            'all_frame_ids': None,
+            'image_counts': None,
+            'all_metadata': None,
         }
+    
+    def get_batch(self, indices: List[int]) -> Dict[str, Any]:
+        """
+        Get a batch of samples, using prefetched data if available.
+        
+        If prefetch_batch() was called with matching indices, retrieves
+        the already-decoded frames. Otherwise, falls back to sync decode.
+        
+        Args:
+            indices: List of sample indices
+            
+        Returns:
+            Batch dictionary with collated samples
+        """
+        self._lazy_init_decoder()
+        
+        H = self.ida_aug_conf.get('H', 900)
+        W = self.ida_aug_conf.get('W', 1600)
+        
+        # Check if prefetch matches current request
+        prefetch_hit = (
+            self._prefetch_state['pending'] and
+            self._prefetch_state['indices'] == tuple(indices)
+        )
+        
+        if prefetch_hit:
+            # Use prefetched data
+            with torch.cuda.nvtx.range("Async_Get_Prefetched"):
+                try:
+                    decoded_frames = self._nvc_decoder.DecodeN12ToRGBAsyncGetBuffer(
+                        self._prefetch_state['all_paths'],
+                        self._prefetch_state['all_frame_ids'],
+                        True
+                    )
+                    all_metadata = self._prefetch_state['all_metadata']
+                    image_counts = self._prefetch_state['image_counts']
+                except Exception as e:
+                    print(f"ERROR: Failed to get prefetched buffer: {e}")
+                    decoded_frames = None
+                finally:
+                    self._prefetch_state['pending'] = False
+            
+            # Fallback if get buffer failed
+            if decoded_frames is None:
+                prefetch_hit = False
+        
+        if not prefetch_hit:
+            # Sync decode (first batch or prefetch miss)
+            with torch.cuda.nvtx.range("Async_Sync_Decode"):
+                all_metadata, abs_paths, all_frame_ids, image_counts = \
+                    self._collect_batch_info(indices)
+                
+                try:
+                    decoded_frames = self._nvc_decoder.DecodeN12ToRGB(
+                        abs_paths,
+                        all_frame_ids,
+                        True
+                    )
+                except Exception as e:
+                    print(f"ERROR: NVC DecodeN12ToRGB failed: {e}")
+                    decoded_frames = [
+                        torch.randint(0, 256, (H, W, 3), dtype=torch.uint8,
+                                      device=f'cuda:{self._gpu_id}')
+                        for _ in abs_paths
+                    ]
+        
+        # Convert RGBFrame to torch tensors with deep copy
+        # Deep copy is required because decode buffer will be reused
+        with torch.cuda.nvtx.range("Convert_And_Clone"):
+            gpu_images = []
+            for frame in decoded_frames:
+                try:
+                    tensor = torch.tensor(frame, dtype=torch.uint8).to(
+                        device=f'cuda:{self._gpu_id}', dtype=torch.float32, non_blocking=True
+                    ).clone()  # Deep copy for async safety
+                    gpu_images.append(tensor)
+                except Exception as e:
+                    print(f"ERROR: Failed to convert frame: {e}")
+                    fallback = torch.randint(0, 256, (H, W, 3), dtype=torch.float32,
+                                             device=f'cuda:{self._gpu_id}')
+                    gpu_images.append(fallback)
+        
+        # Batch transform
+        with torch.cuda.nvtx.range("Batch_Transform"):
+            if self.gpu_preprocess:
+                # GPU mode: Transform ALL images at once
+                with torch.cuda.nvtx.range("GPU_Transform_All"):
+                    all_transformed, _ = self.transforms(gpu_images, all_metadata[0])
+                
+                all_img_tensors = []
+                all_updated_metadata = []
+                
+                img_idx = 0
+                for i, metadata in enumerate(all_metadata):
+                    num_imgs = image_counts[i]
+                    sample_tensor = all_transformed[img_idx:img_idx + num_imgs]
+                    img_idx += num_imgs
+                    
+                    updated_meta = update_metadata_for_transform(
+                        metadata,
+                        resize=self.transforms.resize,
+                        crop_h=self.transforms.crop_h,
+                        crop_w=self.transforms.crop_w,
+                        final_dim=self.transforms.final_dim,
+                    )
+                    all_img_tensors.append(sample_tensor)
+                    all_updated_metadata.append(updated_meta)
+            else:
+                # CPU mode fallback
+                import numpy as np
+                from .batch_utils import images_to_tensor
+                
+                all_img_tensors = []
+                all_updated_metadata = []
+                
+                all_images_np = [img.cpu().numpy() for img in gpu_images]
+                
+                img_idx = 0
+                for i, metadata in enumerate(all_metadata):
+                    num_imgs = image_counts[i]
+                    sample_images = all_images_np[img_idx:img_idx + num_imgs]
+                    img_idx += num_imgs
+                    
+                    images, _ = self.transforms(sample_images, metadata)
+                    img_tensor = images_to_tensor(images)
+                    
+                    updated_meta = update_metadata_for_transform(
+                        metadata,
+                        resize=self.transforms.resize,
+                        crop_h=self.transforms.crop_h,
+                        crop_w=self.transforms.crop_w,
+                        final_dim=self.transforms.final_dim,
+                    )
+                    all_img_tensors.append(img_tensor)
+                    all_updated_metadata.append(updated_meta)
+        
+        # Build samples
+        with torch.cuda.nvtx.range("Build_Samples"):
+            pad_shape = self.transforms.get_pad_shape()
+            samples = []
+            
+            for img_tensor, metadata in zip(all_img_tensors, all_updated_metadata):
+                num_views = img_tensor.shape[0]
+                img_metas = build_img_metas(
+                    metadata, pad_shape, self.img_norm_cfg,
+                    self.ida_aug_conf, num_views
+                )
+                sample = build_sample(img_tensor, metadata, img_metas)
+                samples.append(sample)
+        
+        # Collate
+        with torch.cuda.nvtx.range("Collate"):
+            return collate_samples(samples)
+    
+    def supports_prefetch(self) -> bool:
+        """Check if this provider supports async prefetching."""
+        return True
+    
+    def prefetch_next_batch(self) -> bool:
+        """
+        Prefetch the next batch based on sampler state.
+        
+        Uses the sampler to peek at next frame's indices and starts
+        async decode. Call this after get_multi_video_batch() to overlap
+        decode with inference.
+        
+        Returns:
+            True if prefetch was initiated, False otherwise
+        """
+        if self._sampler is None:
+            return False
+        
+        # Peek at next batch indices without advancing
+        next_indices = self._sampler.peek_next_indices()
+        if next_indices is None:
+            return False
+        
+        self.prefetch_batch(next_indices)
+        return self._prefetch_state['pending']
     
     def __repr__(self) -> str:
         """Return a string representation of the provider."""
@@ -426,8 +428,8 @@ class VideoDataProviderACCVStreamAsync(BaseDataProvider):
             f"{self.__class__.__name__}("
             f"video_base_path={self.video_base_path}, "
             f"num_cameras={self.num_cameras}, "
+            f"batch_size={self.batch_size}, "
             f"gpu_id={self._gpu_id}, "
             f"gpu_preprocess={self.gpu_preprocess}, "
             f"prefetch_pending={self._prefetch_state['pending']})"
         )
-

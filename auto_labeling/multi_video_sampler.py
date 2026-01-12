@@ -3,7 +3,7 @@
 # MultiVideoSampler - Sampler for parallel multi-video inference
 # ------------------------------------------------------------------------
 
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 
 class MultiVideoSampler:
@@ -169,6 +169,41 @@ class MultiVideoSampler:
                     all_exhausted = False
         
         return not all_exhausted
+    
+    def peek_next_indices(self) -> Optional[List[int]]:
+        """
+        Peek at next batch indices without advancing frame pointers.
+        
+        Used by async providers to prefetch the next batch.
+        
+        Returns:
+            List of sample indices for next frame, or None if exhausted
+        """
+        # Check if there would be more frames
+        has_more = False
+        for i in range(self.batch_size):
+            if self.active_mask[i]:
+                video_length = self.get_video_length(i)
+                if self.frame_pointers[i] + 1 < video_length:
+                    has_more = True
+                    break
+        
+        if not has_more:
+            return None
+        
+        # Compute next indices without modifying state
+        indices = []
+        for i in range(self.batch_size):
+            video_idx = self.batch_assignments[i]
+            next_frame_ptr = self.frame_pointers[i] + 1
+            scene_token, frame_indices = self.videos[video_idx]
+            
+            actual_frame_ptr = next_frame_ptr % len(frame_indices)
+            sample_idx = frame_indices[actual_frame_ptr]
+            
+            indices.append(sample_idx)
+        
+        return indices
     
     def get_scene_tokens(self) -> List[str]:
         """

@@ -7,6 +7,7 @@ docker run --gpus all -it --name streampetr_opt_torch102634 --shm-size=16g -v /h
 
 ## prepare code
 git clone ssh://git@gitlab-master.nvidia.com:12051/pinjiex/StreamPETR.git
+git checkout pinjie/video_training
 
 ## prepare tset data
 download test data nusense-mini from google driver which contain images, videos, GOP bin, pkl
@@ -51,6 +52,7 @@ pip uninstall -y yapf && pip install yapf==0.40.1 --user
 # rm -rf /usr/local/lib/python3.12/dist-packages/cv2/
 
 apt update && apt install -y libgl1-mesa-dev #https://github.com/NVIDIA/DALI/issues/5052
+# apt update && apt install -y libgl1 libglx-mesa0
 
 # #if you want to use accvlab based video training
 # pip uninstall opencv-python -y
