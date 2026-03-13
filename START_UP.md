@@ -6,12 +6,13 @@ docker run --gpus all -it --name streampetr_opt_torch102634 --shm-size=16g -v /h
 ```
 
 ## prepare code
+```bash
 git clone ssh://git@gitlab-master.nvidia.com:12051/pinjiex/StreamPETR.git
 git checkout pinjie/video_training
+```
 
 ## prepare tset data
-download test data nusense-mini from google driver which contain images, videos, GOP bin, pkl
-
+download test data nusense-mini from [google driver](https://drive.google.com/file/d/18WZncuftHuE-hFJrzULHcO8L01axU0QH/view?usp=drive_link) which contain images, videos, GOP bin, pkl
 
 ## install mmcv
 ```bash
