@@ -24,10 +24,27 @@ nus_attributes = ('cycle.with_rider', 'cycle.without_rider',
                   'vehicle.parked', 'vehicle.stopped', 'None')
 
 
+def _match_scenes_by_split(available_scenes, split_names):
+    """Return a set of scene tokens whose name (or base name without _x{n} suffix)
+    appears in split_names.  Handles datasets duplicated by create_nusc_mini_x8_dataset.py
+    where scene names have an appended _x{n} suffix.
+    """
+    import re
+    split_set = set(split_names)
+    tokens = set()
+    for scene in available_scenes:
+        name = scene['name']
+        base = re.sub(r'_x\d+$', '', name)
+        if name in split_set or base in split_set:
+            tokens.add(scene['token'])
+    return tokens
+
+
 def create_nuscenes_infos(root_path,
                           info_prefix,
                           version='v1.0-trainval',
-                          max_sweeps=10):
+                          max_sweeps=10,
+                          out_dir=None):
     """Create info file of nuscene dataset.
 
     Given the raw data, generate its related info file in pkl format.
@@ -61,18 +78,8 @@ def create_nuscenes_infos(root_path,
 
     # filter existing scenes.
     available_scenes = get_available_scenes(nusc)
-    available_scene_names = [s['name'] for s in available_scenes]
-    train_scenes = list(
-        filter(lambda x: x in available_scene_names, train_scenes))
-    val_scenes = list(filter(lambda x: x in available_scene_names, val_scenes))
-    train_scenes = set([
-        available_scenes[available_scene_names.index(s)]['token']
-        for s in train_scenes
-    ])
-    val_scenes = set([
-        available_scenes[available_scene_names.index(s)]['token']
-        for s in val_scenes
-    ])
+    train_scenes = _match_scenes_by_split(available_scenes, train_scenes)
+    val_scenes   = _match_scenes_by_split(available_scenes, val_scenes)
 
     test = 'test' in version
     if test:
@@ -83,22 +90,24 @@ def create_nuscenes_infos(root_path,
     train_nusc_infos, val_nusc_infos = _fill_trainval_infos(
         nusc, train_scenes, val_scenes, test, max_sweeps=max_sweeps)
 
+    save_dir = out_dir if out_dir is not None else root_path
+    import os; os.makedirs(save_dir, exist_ok=True)
     metadata = dict(version=version)
     if test:
         print('test sample: {}'.format(len(train_nusc_infos)))
         data = dict(infos=train_nusc_infos, metadata=metadata)
-        info_path = osp.join(root_path,
+        info_path = osp.join(save_dir,
                              '{}_temporal_infos_test.pkl'.format(info_prefix))
         mmcv.dump(data, info_path)
     else:
         print('train sample: {}, val sample: {}'.format(
             len(train_nusc_infos), len(val_nusc_infos)))
         data = dict(infos=train_nusc_infos, metadata=metadata)
-        info_path = osp.join(root_path,
+        info_path = osp.join(save_dir,
                              '{}_temporal_infos_train.pkl'.format(info_prefix))
         mmcv.dump(data, info_path)
         data['infos'] = val_nusc_infos
-        info_val_path = osp.join(root_path,
+        info_val_path = osp.join(save_dir,
                                  '{}_temporal_infos_val.pkl'.format(info_prefix))
         mmcv.dump(data, info_val_path)
 
@@ -173,7 +182,9 @@ def _fill_trainval_infos(nusc,
         pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
 
-        mmcv.check_file_exist(lidar_path)
+        if not os.path.exists(lidar_path):
+            frame_idx = 0
+            continue
 
 
         info = {

@@ -9,23 +9,11 @@ from data_converter import nuscenes_converter as nuscenes_converter
 def nuscenes_data_prep(root_path,
                        info_prefix,
                        version,
-                       max_sweeps=10):
-    """Prepare data related to nuScenes dataset.
-
-    Related data consists of '.pkl' files recording basic infos,
-    2D annotations and groundtruth database.
-
-    Args:
-        root_path (str): Path of dataset root.
-        info_prefix (str): The prefix of info filenames.
-        version (str): Dataset version.
-        dataset_name (str): The dataset class name.
-        out_dir (str): Output directory of the groundtruth database info.
-        max_sweeps (int, optional): Number of input consecutive frames.
-            Default: 10
-    """
+                       max_sweeps=10,
+                       out_dir=None):
     nuscenes_converter.create_nuscenes_infos(
-        root_path, info_prefix, version=version, max_sweeps=max_sweeps)
+        root_path, info_prefix, version=version, max_sweeps=max_sweeps,
+        out_dir=out_dir)
 
 
 parser = argparse.ArgumentParser(description='Data converter arg parser')
@@ -62,17 +50,20 @@ if __name__ == '__main__':
             root_path=args.root_path,
             info_prefix=args.extra_tag,
             version=train_version,
-            max_sweeps=args.max_sweeps)
+            max_sweeps=args.max_sweeps,
+            out_dir=args.out_dir)
         test_version = f'{args.version}-test'
         nuscenes_data_prep(
             root_path=args.root_path,
             info_prefix=args.extra_tag,
             version=test_version,
-            max_sweeps=args.max_sweeps)
+            max_sweeps=args.max_sweeps,
+            out_dir=args.out_dir)
     elif args.version == 'v1.0-mini':
         train_version = f'{args.version}'
         nuscenes_data_prep(
             root_path=args.root_path,
             info_prefix=args.extra_tag,
             version=train_version,
-            max_sweeps=args.max_sweeps)
+            max_sweeps=args.max_sweeps,
+            out_dir=args.out_dir)
