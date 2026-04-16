@@ -84,6 +84,8 @@ class Petr3D(MVXTwoStageDetector):
         self._gop_decoder = None
         self.batch_size = batch_size
         self.num_cameras = num_cameras
+        # SharedGOPPool reference (set externally after DataLoader creation)
+        self._shared_gop_pool = None
 
     def _init_gop_decoder(self):
         """Lazy initialization of GOP decoder"""
@@ -596,6 +598,20 @@ class Petr3D(MVXTwoStageDetector):
         video_paths_list = _unwrap(data.get('video_paths'))
         video_frame_ids_list = _unwrap(data.get('video_frame_ids'))
 
+        # Resolve SharedGOPPool references to numpy views (zero-copy)
+        gop_from_pool_raw = data.get('gop_from_pool')
+        gop_from_pool = _unwrap(gop_from_pool_raw) if gop_from_pool_raw is not None else False
+        # gop_from_pool after collate is a list of per-sample booleans, check first
+        if isinstance(gop_from_pool, list):
+            gop_from_pool = gop_from_pool[0] if gop_from_pool else False
+
+        if gop_from_pool and self._shared_gop_pool is not None:
+            with nvtx.annotate("resolve_pool_refs", color="yellow"):
+                # Atomically open all shm handles under flock so that
+                # eviction cannot unlink a block between lookup and open.
+                gop_data_list = self._shared_gop_pool.resolve_batch(
+                    gop_data_list)
+
         if video_paths_list is None:
             video_paths_list = [[]] * len(gop_data_list)
         if video_frame_ids_list is None:
@@ -638,6 +654,7 @@ class Petr3D(MVXTwoStageDetector):
         data.pop('GOP', None)
         data.pop('video_paths', None)
         data.pop('video_frame_ids', None)
+        data.pop('gop_from_pool', None)
 
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
         """Extract features of images."""

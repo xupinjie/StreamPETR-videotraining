@@ -15,6 +15,7 @@
 #   mainprocess  — demuxer-free GOP: workers send GOP bytes to main process, main process decodes on GPU (serial)
 #   prefetch     — demuxer-free GOP + prefetch: same as mainprocess, but decode runs on a background
 #                  thread with a dedicated CUDA stream, overlapping with backward pass
+#   prefetch_pool — prefetch + SharedGOPPool: cross-worker shared GOP cache with zero-copy reads
 #   opencv       — video OpenCV: DataLoader workers decode video frames on CPU using cv2.VideoCapture
 
 set -e
@@ -65,12 +66,15 @@ case $VARIANT in
   prefetch)
     TEMPLATE="$CFG_DIR/base_video_demuxer_free_mainprocess_prefetch_minix8.py"
     ;;
+  prefetch_pool)
+    TEMPLATE="$CFG_DIR/base_video_demuxer_free_mainprocess_prefetch_pool_minix8.py"
+    ;;
   opencv)
     TEMPLATE="$CFG_DIR/base_video_opencv_minix8.py"
     ;;
   *)
     echo "Error: unknown variant '$VARIANT'"
-    echo "Choose from: image, stream, worker, mainprocess, prefetch, opencv"
+    echo "Choose from: image, stream, worker, mainprocess, prefetch, prefetch_pool, opencv"
     exit 1
     ;;
 esac

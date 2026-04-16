@@ -28,6 +28,10 @@ class_names = [
 num_cameras = 6
 num_gpus = 8
 batch_size = 2
+
+# SharedGOPPool: set to dict(scale=3, num_cameras=num_cameras) to enable
+# See prefetch_pool variant for the enabled version
+shared_gop_pool = None
 # mini x8: ~320 train samples × 8 = 2560
 num_iters_per_epoch = 2560 // (num_gpus * batch_size)
 num_epochs = 24
@@ -174,7 +178,8 @@ train_pipeline = [
         ida_aug_conf=ida_aug_conf,
         video_base_path=data_root + "video_samples",
         gop_base_path=data_root + "video_samples_packets",
-        to_float32=True),
+        to_float32=True,
+        shared_gop_pool=shared_gop_pool),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_bbox=True,
         with_label=True, with_bbox_depth=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
@@ -188,7 +193,7 @@ train_pipeline = [
             training=True,
             ),
     dict(type='PETRFormatBundle3D', class_names=class_names, collect_keys=collect_keys + ['prev_exists']),
-    dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'GOP', 'video_paths', 'video_frame_ids', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys,
+    dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'GOP', 'video_paths', 'video_frame_ids', 'gop_from_pool', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys,
              meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d', 'gt_labels_3d', 'ida_aug_params'))
 ]
 test_pipeline = [
@@ -198,7 +203,8 @@ test_pipeline = [
         ida_aug_conf=ida_aug_conf,
         video_base_path=data_root + "video_samples",
         gop_base_path=data_root + "video_samples_packets",
-        to_float32=True),
+        to_float32=True,
+        shared_gop_pool=shared_gop_pool),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -210,7 +216,7 @@ test_pipeline = [
                 collect_keys=collect_keys,
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['GOP', 'video_paths', 'video_frame_ids'] + collect_keys,
+            dict(type='Collect3D', keys=['GOP', 'video_paths', 'video_frame_ids', 'gop_from_pool'] + collect_keys,
             meta_keys=('filename', 'ori_shape', 'img_shape','pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token'))
         ])
 ]

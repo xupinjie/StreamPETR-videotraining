@@ -6,6 +6,7 @@
 # ---------------------------------------------
 #  Modified by Shihao Wang
 # ---------------------------------------------
+import os
 import random
 import warnings
 
@@ -59,6 +60,23 @@ def custom_train_detector(model,
                 f'{cfg.data.imgs_per_gpu} in this experiments')
         cfg.data.samples_per_gpu = cfg.data.imgs_per_gpu
 
+    # --- Create SharedGOPPool (before DataLoader workers start) ---
+    shared_gop_pool = None
+    pool_cfg = cfg.get('shared_gop_pool', None)
+    if pool_cfg is not None:
+        from projects.mmdet3d_plugin.datasets.shared_gop_pool import SharedGOPPool
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        scale = pool_cfg.get('scale', 3)
+        batch_size = cfg.data.samples_per_gpu
+        num_cameras = pool_cfg.get('num_cameras', 6)
+        capacity = batch_size * num_cameras * scale
+        shared_gop_pool = SharedGOPPool(
+            capacity=capacity, pool_id=local_rank, create=True)
+        logger.info(
+            f'SharedGOPPool created: capacity={capacity} '
+            f'(bs={batch_size} x cam={num_cameras} x scale={scale}), '
+            f'pool_id={local_rank}')
+
     data_loaders = [
         build_dataloader(
             ds,
@@ -99,6 +117,13 @@ def custom_train_detector(model,
             eval_model = MMDataParallel(
                 eval_model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
+
+    # --- Pass SharedGOPPool to model ---
+    if shared_gop_pool is not None:
+        unwrapped = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped, '_shared_gop_pool'):
+            unwrapped._shared_gop_pool = shared_gop_pool
+            logger.info('SharedGOPPool attached to model')
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)
@@ -276,4 +301,9 @@ def custom_train_detector(model,
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
+
+    # --- Cleanup SharedGOPPool ---
+    if shared_gop_pool is not None:
+        shared_gop_pool.cleanup()
+        logger.info('SharedGOPPool cleaned up')
 

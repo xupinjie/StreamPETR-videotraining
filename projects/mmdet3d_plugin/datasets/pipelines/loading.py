@@ -191,11 +191,12 @@ class GOPStorageManager:
     Manager for storing and loading GOP (Group of Pictures) data using binary format.
 
     This class provides a hierarchical storage system for video GOP data.
+    Supports optional SharedGOPPool for cross-worker shared caching with zero-copy.
     """
 
     def __init__(
-        self, nv_gop_demuxer, video_base_path: str, gop_base_path: str, clip_size: int, 
-        cache_capacity: int = 0
+        self, nv_gop_demuxer, video_base_path: str, gop_base_path: str, clip_size: int,
+        cache_capacity: int = 0, shared_pool=None
     ):
         """
         Initialize the GOP Storage Manager.
@@ -206,17 +207,26 @@ class GOPStorageManager:
             gop_base_path (str): Base directory for storing GOP data
             clip_size (int): Maximum number of files to use
             cache_capacity (int): Number of GOP cache lines. 0 disables caching. Default: 0
+            shared_pool: SharedGOPPool instance for cross-worker caching. None disables. Default: None
         """
         self.video_base_path = video_base_path
         self.gop_base_path = gop_base_path
         self.nv_gop_demuxer = nv_gop_demuxer
-        
-        # Initialize GOP cache if capacity > 0
-        self.gop_cache = GOPCache(cache_capacity) if cache_capacity > 0 else None
+        self.shared_pool = shared_pool
+
+        # Per-worker persistent index cache: video_path → List[GOPInfo]
+        self._index_cache = {}
+
+        # Initialize GOP cache if capacity > 0 (per-worker, used when shared_pool is None)
+        self.gop_cache = GOPCache(cache_capacity) if cache_capacity > 0 and shared_pool is None else None
         if self.gop_cache:
             import multiprocessing
             worker_id = multiprocessing.current_process().name
             print(f"[Worker: {worker_id}] GOP cache initialized with capacity {cache_capacity}")
+        if self.shared_pool:
+            import multiprocessing
+            worker_id = multiprocessing.current_process().name
+            print(f"[Worker: {worker_id}] Using SharedGOPPool (capacity={shared_pool.capacity})")
 
     def _load_persistent_index(self, video_path: str) -> List[GOPInfo]:
         """
@@ -437,6 +447,96 @@ class GOPStorageManager:
         if self.gop_cache is not None:
             self.gop_cache.clear()
 
+    def _get_gop_index(self, video_path: str) -> List[GOPInfo]:
+        """
+        Get GOP index for a video, using per-worker cache to avoid repeated dir scans.
+
+        Args:
+            video_path: Path to the video file.
+
+        Returns:
+            Sorted list of GOPInfo, or empty list on error.
+        """
+        if video_path not in self._index_cache:
+            self._index_cache[video_path] = self._load_persistent_index(video_path)
+        return self._index_cache[video_path]
+
+    def load_gops_shared(self, frame_ids: List[int], video_paths: List[str]) -> Optional[List[tuple]]:
+        """
+        Load GOPs via SharedGOPPool. Returns references (shm_name, data_size) instead of data.
+
+        Flow per camera:
+        1. Pool lookup (lock-free read of shared memory metadata)
+        2. Hit → return (shm_name, data_size) reference
+        3. Miss → find GOP file from persistent index → batch disk read → pool.put()
+
+        Args:
+            frame_ids: List of target frame indices (one per camera).
+            video_paths: List of video file paths (one per camera).
+
+        Returns:
+            List of (shm_name, data_size) tuples, or None on error.
+        """
+        torch.cuda.nvtx.range_push("load_gops_shared")
+
+        if len(frame_ids) != len(video_paths):
+            print(f"Error: frame_ids length ({len(frame_ids)}) != video_paths length ({len(video_paths)})")
+            torch.cuda.nvtx.range_pop()
+            return None
+
+        pool = self.shared_pool
+        results = [None] * len(video_paths)
+        misses = []  # (index, video_path, frame_id, gop_info)
+
+        # ========== Phase 1: Pool lookup ==========
+        torch.cuda.nvtx.range_push("pool_lookup")
+        for i, (vpath, fid) in enumerate(zip(video_paths, frame_ids)):
+            hit = pool.lookup(vpath, fid)
+            if hit is not None:
+                results[i] = (hit[0], hit[1])  # (shm_name, data_size)
+            else:
+                # Need to find GOP info for disk loading
+                gop_infos = self._get_gop_index(vpath)
+                if not gop_infos:
+                    print(f"Error: No GOP index found for video {vpath}")
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_pop()
+                    return None
+                gop_info = self._find_gop_for_frame(gop_infos, fid)
+                if gop_info is None:
+                    print(f"Error: Could not find GOP for video {vpath}, frame {fid}")
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_pop()
+                    return None
+                misses.append((i, vpath, fid, gop_info))
+        torch.cuda.nvtx.range_pop()  # pool_lookup
+
+        # ========== Phase 2: Batch disk read for misses ==========
+        if misses:
+            torch.cuda.nvtx.range_push("pool_batch_load")
+            miss_gop_files = [info.file_path for _, _, _, info in misses]
+            try:
+                loaded_list = self.nv_gop_demuxer.LoadGopsToList(miss_gop_files)
+                for (idx, vpath, fid, info), gop_data in zip(misses, loaded_list):
+                    shm_name, data_size = pool.put(
+                        vpath, info.first_frame_id, info.gop_len, gop_data)
+                    results[idx] = (shm_name, data_size)
+            except Exception as e:
+                print(f"Error batch loading GOPs via pool: {e}")
+                torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_pop()
+                return None
+            torch.cuda.nvtx.range_pop()  # pool_batch_load
+
+        # Verify completeness
+        if any(r is None for r in results):
+            print("Error: Some GOP refs missing after pool load")
+            torch.cuda.nvtx.range_pop()
+            return None
+
+        torch.cuda.nvtx.range_pop()  # load_gops_shared
+        return results
+
 
 @PIPELINES.register_module()
 class LoadMultiViewImageFromGOP_demuxer_free(object):
@@ -654,7 +754,8 @@ class LoadMultiViewImageFromGOP_demuxer_free_gop_output(object):
             Defaults to 192 (16 * 6 * 2).
     """
 
-    def __init__(self, batch_size, num_cameras, ida_aug_conf, video_base_path, gop_base_path, to_float32=False, color_type='unchanged'):
+    def __init__(self, batch_size, num_cameras, ida_aug_conf, video_base_path, gop_base_path,
+                 to_float32=False, color_type='unchanged', shared_gop_pool=None):
         self.to_float32 = to_float32
         self.color_type = color_type
         self.cache_capacity = batch_size * num_cameras * 2
@@ -664,28 +765,44 @@ class LoadMultiViewImageFromGOP_demuxer_free_gop_output(object):
         self.final_dim = ida_aug_conf["final_dim"]
         self._storage: GOPStorageManager = None
         self._nv_gop_dec = None
-        
-        # For cache statistics
+        self._shared_pool = None
+
+        # Shared pool config (capacity will be computed from scale)
+        self._shared_gop_pool_cfg = shared_gop_pool  # dict with 'scale' key, or None
+
+        # For cache/pool statistics
         self._call_count = 0
         self._stats_print_interval = 100  # Print stats every 100 calls
 
         self.video_base_path = video_base_path
         self.gop_base_path = gop_base_path
+
     def __lazy_init__(self):
-        """Lazy initialization of GOP decoder and storage manager."""
+        """Lazy initialization of GOP decoder, storage manager, and shared pool."""
         if self._nv_gop_dec is not None:
             return
 
         self._nv_gop_dec = nvc.CreateGopDecoder(
-            maxfiles=self.num_cameras,  # Maximum number of files to use
-            iGpu=int(os.environ["LOCAL_RANK"]),  # GPU ID
+            maxfiles=self.num_cameras,
+            iGpu=int(os.environ["LOCAL_RANK"]),
         )
+
+        # Attach to SharedGOPPool if configured
+        if self._shared_gop_pool_cfg is not None:
+            from projects.mmdet3d_plugin.datasets.shared_gop_pool import SharedGOPPool
+            pool_id = int(os.environ["LOCAL_RANK"])
+            scale = self._shared_gop_pool_cfg.get('scale', 3)
+            capacity = self.batch_size * self.num_cameras * scale
+            self._shared_pool = SharedGOPPool(
+                capacity=capacity, pool_id=pool_id, create=False)
+
         self._storage = GOPStorageManager(
             nv_gop_demuxer=self._nv_gop_dec,
             video_base_path=self.video_base_path,
             gop_base_path=self.gop_base_path,
             clip_size=self.num_cameras,
-            cache_capacity=self.cache_capacity,  # Enable GOP cache
+            cache_capacity=self.cache_capacity,
+            shared_pool=self._shared_pool,
         )
 
     @nvtx.annotate("LoadMultiViewImageWithGOP", color="green")
@@ -720,11 +837,16 @@ class LoadMultiViewImageFromGOP_demuxer_free_gop_output(object):
         C = 3
         NUM_CAMERAS = self.num_cameras
         
-        # Load GOPs (returns List[np.ndarray] - raw GOP bytes)
-        gop_data_list = self._storage.load_gops(video_frame_ids, filename)
-        
-        # Store GOP data for GPU decoding in main process
-        results['GOP'] = gop_data_list  # List of GOP byte arrays
+        # Load GOPs: shared pool path returns references, legacy path returns np.ndarray
+        if self._shared_pool is not None:
+            gop_refs = self._storage.load_gops_shared(video_frame_ids, filename)
+            results['GOP'] = gop_refs            # List[(shm_name, data_size)] or None
+            results['gop_from_pool'] = True      # flag for main process
+        else:
+            gop_data_list = self._storage.load_gops(video_frame_ids, filename)
+            results['GOP'] = gop_data_list       # List[np.ndarray] or None
+            results['gop_from_pool'] = False
+
         results['filename'] = filename
         results['video_frame_ids'] = video_frame_ids
         
@@ -752,18 +874,26 @@ class LoadMultiViewImageFromGOP_demuxer_free_gop_output(object):
         
         # NOTE: results['img'] is NOT set here - will be decoded on GPU in main process
         
-        # Print cache statistics periodically
+        # Print statistics periodically
         self._call_count += 1
         if self._call_count % self._stats_print_interval == 0:
-            cache_stats = self._storage.get_cache_stats()
-            if cache_stats:
-                import multiprocessing
-                worker_id = multiprocessing.current_process().name
-                print(f"[{worker_id}] GOP Cache Stats after {self._call_count} calls: "
-                        f"hits={cache_stats['hits']}, misses={cache_stats['misses']}, "
-                        f"hit_rate={cache_stats['hit_rate']:.2%}, "
-                        f"size={cache_stats['size']}/{cache_stats['capacity']}")
-    
+            import multiprocessing
+            worker_id = multiprocessing.current_process().name
+            if self._shared_pool is not None:
+                pool_stats = self._shared_pool.get_stats()
+                print(f"[{worker_id}] SharedGOPPool Stats after {self._call_count} calls: "
+                      f"hits={pool_stats['hits']}, misses={pool_stats['misses']}, "
+                      f"hit_rate={pool_stats['hit_rate']:.2%}, "
+                      f"puts={pool_stats['puts']}, evictions={pool_stats['evictions']}, "
+                      f"usage={pool_stats['pool_usage']}")
+            else:
+                cache_stats = self._storage.get_cache_stats()
+                if cache_stats:
+                    print(f"[{worker_id}] GOP Cache Stats after {self._call_count} calls: "
+                          f"hits={cache_stats['hits']}, misses={cache_stats['misses']}, "
+                          f"hit_rate={cache_stats['hit_rate']:.2%}, "
+                          f"size={cache_stats['size']}/{cache_stats['capacity']}")
+
         return results
 
     def __repr__(self):
@@ -771,6 +901,7 @@ class LoadMultiViewImageFromGOP_demuxer_free_gop_output(object):
         repr_str = self.__class__.__name__
         repr_str += f'(to_float32={self.to_float32}, '
         repr_str += f"color_type='{self.color_type}', "
-        repr_str += f'cache_capacity={self.cache_capacity})'
+        repr_str += f'cache_capacity={self.cache_capacity}, '
+        repr_str += f'shared_gop_pool={self._shared_gop_pool_cfg})'
         return repr_str
 

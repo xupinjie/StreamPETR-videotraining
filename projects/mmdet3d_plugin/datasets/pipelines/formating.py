@@ -115,7 +115,9 @@ class PETRFormatBundle3D(DefaultFormatBundle):
             results['video_paths'] = DC(results['video_paths'], stack=False, cpu_only=True)
         if 'video_frame_ids' in results:
             results['video_frame_ids'] = DC(results['video_frame_ids'], stack=False, cpu_only=True)
-        
+        if 'gop_from_pool' in results:
+            results['gop_from_pool'] = DC(results['gop_from_pool'], stack=False, cpu_only=True)
+
         results = super(PETRFormatBundle3D, self).__call__(results)
         return results
 

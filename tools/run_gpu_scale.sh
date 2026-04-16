@@ -10,6 +10,7 @@
 #   mainprocess  — demuxer-free GOP: workers send GOP bytes to main process, main process decodes on GPU (serial)
 #   prefetch     — demuxer-free GOP + prefetch: same as mainprocess, but decode runs on a background
 #                  thread with a dedicated CUDA stream, overlapping with backward pass
+#   prefetch_pool — prefetch + SharedGOPPool: cross-worker shared GOP cache with zero-copy reads
 #   opencv       — video OpenCV: DataLoader workers decode video frames on CPU using cv2.VideoCapture
 #
 # Usage:
@@ -51,6 +52,9 @@ if [ -z "$VARIANT" ] || [ "$VARIANT" = "mainprocess" ]; then
 fi
 if [ -z "$VARIANT" ] || [ "$VARIANT" = "prefetch" ]; then
   run_variant prefetch
+fi
+if [ -z "$VARIANT" ] || [ "$VARIANT" = "prefetch_pool" ]; then
+  run_variant prefetch_pool
 fi
 if [ -z "$VARIANT" ] || [ "$VARIANT" = "opencv" ]; then
   run_variant opencv
