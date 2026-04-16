@@ -39,26 +39,27 @@ class LoadMultiViewImageFromVideo_opencv(object):
     def __lazy_init__(self):
         if self.video_cap_cache is None:
             # Use OrderedDict as LRU cache for VideoCapture objects
+            # Value: (cv2.VideoCapture, current_frame_position)
             self.video_cap_cache = OrderedDict()
-    
+
     def _get_video_capture(self, video_path):
         """Get or create a VideoCapture object for the given video path.
-        
+
         Args:
             video_path (str): Path to the video file.
-            
+
         Returns:
-            cv2.VideoCapture: VideoCapture object for the video.
+            tuple: (cv2.VideoCapture, current_frame_pos) for the video.
         """
         # Check if video_path is in cache
         if video_path in self.video_cap_cache:
             # Move to end (most recently used)
             self.video_cap_cache.move_to_end(video_path)
             return self.video_cap_cache[video_path]
-        
+
         # Convert to absolute path
         abs_path = os.path.abspath(video_path)
-        
+
         # Create new VideoCapture with absolute path
         cap = cv2.VideoCapture(abs_path)
         if not cap.isOpened():
@@ -67,24 +68,52 @@ class LoadMultiViewImageFromVideo_opencv(object):
             print(f"  Version: {cv2.__version__}")
             print(f"  Video backend: {cap.getBackendName()}")
             return None
-        
-        # Print video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # print(f"  Video properties: {width}x{height}, {fps} FPS, {frame_count} frames")
-        
-        # Add to cache (use original path as key)
-        self.video_cap_cache[video_path] = cap
-        
+
+        # Add to cache: (cap, current_position)
+        # Position starts at 0 for a freshly opened capture
+        entry = [cap, 0]
+        self.video_cap_cache[video_path] = entry
+
         # Remove oldest if cache is full
         if len(self.video_cap_cache) > self.max_cache_size:
-            oldest_path, oldest_cap = self.video_cap_cache.popitem(last=False)
+            _, (oldest_cap, _) = self.video_cap_cache.popitem(last=False)
             oldest_cap.release()
-        
-        return cap
-    
+
+        return entry
+
+    def _read_frame(self, video_path, frame_id):
+        """Read a frame, using sequential reads to advance instead of seek.
+
+        Args:
+            video_path (str): Path to the video file.
+            frame_id (int): Target frame index.
+
+        Returns:
+            np.ndarray: Decoded frame (H, W, 3) in BGR.
+        """
+        entry = self._get_video_capture(video_path)
+        if entry is None:
+            raise ValueError(f"Failed to get VideoCapture for {video_path}")
+
+        cap, cur_pos = entry
+
+        if cur_pos <= frame_id:
+            # Forward: skip-read to target (avoids expensive keyframe seek)
+            for _ in range(frame_id - cur_pos):
+                cap.read()
+        else:
+            # Backward: must seek
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            raise ValueError(f"Failed to read frame {frame_id} from {video_path}")
+
+        # Update tracked position (read advances by 1)
+        entry[1] = frame_id + 1
+
+        return frame
+
     @nvtx.annotate("LoadMultiViewImageFromVideo_opencv",color="green")
     def __call__(self, results):
         """Call function to load multi-view image from files.
@@ -112,54 +141,32 @@ class LoadMultiViewImageFromVideo_opencv(object):
         H = self.ida_aug_conf["H"]
         W = self.ida_aug_conf["W"]
         C = 3
-        NUM_CAMERAS = self.num_cameras
 
         filename = results['video_paths']
         video_frame_ids = results["video_frame_ids"]
 
         img = []
-        
+
         # Decode each video frame using OpenCV
         for video_path, frame_id in zip(filename, video_frame_ids):
             try:
-                # Get VideoCapture from cache
-                cap = self._get_video_capture(video_path)
-                
-                if cap is None:
-                    raise ValueError(f"Failed to get VideoCapture for {video_path}")
-                
-                # Set frame position
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
-                
-                # Read frame
-                ret, frame = cap.read()
-                
-                if not ret or frame is None:
-                    raise ValueError(f"Failed to read frame {frame_id} from {video_path}")
-                
+                frame = self._read_frame(video_path, frame_id)
+
                 # Check frame shape
                 if frame.shape[0] != H or frame.shape[1] != W or frame.shape[2] != C:
-                    print(f"ERROR: Frame shape mismatch, resizing. Got {frame.shape}, expected ({H}, {W}, {C})")
                     frame = cv2.resize(frame, (W, H))
-                
-                # Convert to torch tensor (keep BGR format as requested)
-                torch_frame = torch.from_numpy(frame).to(torch.cuda.current_device())
-                
+
             except Exception as e:
                 print(f"ERROR: Failed to decode frame {frame_id} from {video_path}: {e}")
-                print(f"Generating random image as fallback")
-                torch_frame = torch.randint(0, 256, (H, W, C), dtype=torch.uint8).to(torch.cuda.current_device())
-            
-            img.append(torch_frame)
+                frame = np.random.randint(0, 256, (H, W, C), dtype=np.uint8)
 
-        # print("img shape = ", torch_frame.shape)
-        
-        img = torch.stack(img, axis=-1)
-        img = img.detach().cpu().numpy()
+            img.append(frame)
+
+        # Stack along last axis: (H, W, C, N)
+        img = np.stack(img, axis=-1)
         if self.to_float32:
             img = img.astype(np.float32)
-        # print(f"img shape = {img.shape}")
- 
+
         results['filename'] = filename
         # unravel to list, see `DefaultFormatBundle` in formatting.py
         # which will transpose each image separately and then stack into array
@@ -175,11 +182,11 @@ class LoadMultiViewImageFromVideo_opencv(object):
             std=np.ones(num_channels, dtype=np.float32),
             to_rgb=False)
         return results
-    
+
     def __del__(self):
         """Release all cached VideoCapture objects."""
         if hasattr(self, 'video_cap_cache') and self.video_cap_cache is not None:
-            for cap in self.video_cap_cache.values():
+            for (cap, _) in self.video_cap_cache.values():
                 if cap is not None:
                     cap.release()
             self.video_cap_cache.clear()

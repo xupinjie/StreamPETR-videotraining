@@ -141,23 +141,25 @@ class Petr3D(MVXTwoStageDetector):
         # Decode all at once: (B*N) images
         # print("gops_all: ", type(gops_all), len(gops_all), type(gops_all[0]), len(gops_all[0]))
         try:
-            decoded_frames = self._gop_decoder.DecodeFromGOPListRGB(
-                gops_all, paths_all, frame_ids_all, True  # RGB format
-            )
-            
+            with nvtx.annotate("nvc_DecodeFromGOPListRGB", color="blue"):
+                decoded_frames = self._gop_decoder.DecodeFromGOPListRGB(
+                    gops_all, paths_all, frame_ids_all, True  # RGB format
+                )
+
             if decoded_frames is None or len(decoded_frames) != len(gops_all):
                 raise RuntimeError(f"GOP decode failed or returned wrong number of frames")
-            
-            # Convert to tensors
-            imgs = []
-            for decoded_frame in decoded_frames:
-                # img_tensor = torch.from_numpy(frame).permute(2, 0, 1)  # (C, H, W)
-                img_tensor = torch.tensor(decoded_frame, dtype=torch.uint8).to(torch.cuda.current_device())
-                if to_float32:
-                    img_tensor = img_tensor.float()
-                imgs.append(img_tensor)
-            
-            imgs = torch.stack(imgs)  # (B*N, C, H, W)
+
+            # Convert to tensors (zero-copy from __cuda_array_interface__)
+            with nvtx.annotate("as_tensor_and_float", color="cyan"):
+                imgs = []
+                for decoded_frame in decoded_frames:
+                    img_tensor = torch.as_tensor(decoded_frame, device='cuda')
+                    if to_float32:
+                        img_tensor = img_tensor.float()
+                    imgs.append(img_tensor)
+
+            with nvtx.annotate("stack_and_reshape", color="cyan"):
+                imgs = torch.stack(imgs)  # (B*N, C, H, W)
             # Reshape to (B, N, C, H, W)
             N = len(gop_data_list[0])
             decoded_images = imgs.reshape(batch_size, N, C, H, W)
@@ -567,6 +569,76 @@ class Petr3D(MVXTwoStageDetector):
         
         return img
 
+    @nvtx.annotate("decode_and_set_img", color="purple")
+    def _decode_and_set_img(self, data):
+        """Decode GOP data and apply GPU transforms, setting data['img'].
+
+        Can be called from forward() (non-prefetch) or from the prefetch
+        runner (before MMDDP scatter).  Handles DataContainer unwrapping
+        so it works in both contexts.
+        """
+        from mmcv.parallel import DataContainer as DC
+
+        def _unwrap(val):
+            if not isinstance(val, DC):
+                return val
+            raw = val.data
+            # mmcv collate wraps cpu_only DC in GPU-groups:
+            #   DC(data=[[sample0, sample1], ...])
+            # MMDDP scatter peels this to [sample0, sample1].
+            # When called before scatter (prefetch runner), do it here.
+            if (val.cpu_only and isinstance(raw, list)
+                    and len(raw) == 1 and isinstance(raw[0], list)):
+                return raw[0]
+            return raw
+
+        gop_data_list = _unwrap(data['GOP'])
+        video_paths_list = _unwrap(data.get('video_paths'))
+        video_frame_ids_list = _unwrap(data.get('video_frame_ids'))
+
+        if video_paths_list is None:
+            video_paths_list = [[]] * len(gop_data_list)
+        if video_frame_ids_list is None:
+            video_frame_ids_list = [[]] * len(gop_data_list)
+
+        # 1. Decode GOP → images on GPU
+        with nvtx.annotate("decode_gop_batch", color="blue"):
+            decoded_img = self._decode_gop_batch(
+                gop_data_list, video_paths_list,
+                video_frame_ids_list, to_float32=True)
+
+        # 2. Apply GPU transforms (resize, crop, flip, normalize, pad)
+        with nvtx.annotate("unwrap_img_metas", color="cyan"):
+            img_metas_orig = data.get('img_metas')
+            if isinstance(img_metas_orig, DC):
+                raw = img_metas_orig.data
+                if (img_metas_orig.cpu_only and isinstance(raw, list)
+                        and len(raw) == 1 and isinstance(raw[0], list)):
+                    data['img_metas'] = raw[0]
+                else:
+                    data['img_metas'] = raw
+
+        with nvtx.annotate("apply_gpu_transforms", color="magenta"):
+            transformed_img = self._apply_gpu_transforms(
+                decoded_img, data,
+                ida_aug_conf=self.ida_aug_conf,
+                img_norm_cfg=self.img_norm_cfg,
+                global_rot_range=[-0.3925, 0.3925],
+                global_scale_range=[0.95, 1.05],
+                global_trans_std=[0, 0, 0],
+                reverse_angle=True,
+                training=True)
+
+        # Restore img_metas DC wrapper (inner list was modified in-place)
+        if isinstance(img_metas_orig, DC):
+            data['img_metas'] = img_metas_orig
+
+        # 3. Set decoded image and clean up GOP keys
+        data['img'] = transformed_img
+        data.pop('GOP', None)
+        data.pop('video_paths', None)
+        data.pop('video_frame_ids', None)
+
     def extract_img_feat(self, img, len_queue=1, training_mode=False):
         """Extract features of images."""
         B = img.size(0)
@@ -716,87 +788,25 @@ class Petr3D(MVXTwoStageDetector):
         list[list[dict]]), with the outer list indicating test time
         augmentations.
         """
-        if self.enable_gop_decode and 'GOP' not in data:
-            raise ValueError("'GOP' is required in data, for enable_gop_decode")
-        if self.enable_gop_decode and data['GOP'] is None:
-            raise ValueError("data['GOP'] can not be None, for enable_gop_decode")
-
-        # Handle GOP decoding if GOP data is present
-        if self.enable_gop_decode:
-            with nvtx.annotate("gop_decode_and_transform", color="purple"):
-                # Extract GOP-related data from DataContainer if needed
-                from mmcv.parallel import DataContainer as DC
-                
-                if isinstance(data['GOP'], DC):
-                    gop_data_list = data['GOP'].data
-                else:
-                    gop_data_list = data['GOP']
-                
-                # Extract video paths and frame IDs (should also be in data)
-                if 'video_paths' in data:
-                    video_paths_list = data['video_paths'].data if isinstance(data['video_paths'], DC) else data['video_paths']
-                else:
-                    # Fallback: extract from img_metas
-                    if 'img_metas' in data:
-                        img_metas = data['img_metas']
-                        if isinstance(img_metas, DC):
-                            img_metas = img_metas.data
-                        video_paths_list = [meta.get('filename', []) for meta in img_metas]
-                    else:
-                        video_paths_list = [[]] * len(gop_data_list)
-                
-                if 'video_frame_ids' in data:
-                    video_frame_ids_list = data['video_frame_ids'].data if isinstance(data['video_frame_ids'], DC) else data['video_frame_ids']
-                else:
-                    # Fallback: extract from img_metas or use empty
-                    video_frame_ids_list = [[]] * len(gop_data_list)
-                
-                # 1. Decode GOP to images on GPU
-                decoded_img = self._decode_gop_batch(
-                    gop_data_list, 
-                    video_paths_list, 
-                    video_frame_ids_list, 
-                    to_float32=True
-                )
-                # print(f"[GOP Decode] Decoded batch: img shape = {decoded_img.shape}")
-
-        if self.enable_gop_decode or self.enable_transform:
-                # 2. Apply GPU transforms (resize, crop, flip, normalize, pad)
-                # Get augmentation configs from model config or use defaults
-                
-                if not self.enable_gop_decode:
-                    input_img = data['img'].to(torch.float32)
-                else:
-                    input_img = decoded_img
-
-                # Apply all transforms
-                transformed_img = self._apply_gpu_transforms(
-                    input_img,
-                    data,
-                    ida_aug_conf=self.ida_aug_conf,
-                    img_norm_cfg=self.img_norm_cfg,
-                    global_rot_range=[-0.3925, 0.3925],
-                    global_scale_range=[0.95, 1.05],
-                    global_trans_std=[0, 0, 0],
-                    reverse_angle=True,
-                    training=return_loss
-                )
-                # print(f"[GOP Transform] Transformed img shape = {transformed_img.shape}")
-                
-                # Replace 'img' in data with transformed images
-                data['img'] = transformed_img
-                
-                # NOTE: No need to update img_metas here!
-                # Worker (LoadMultiViewImageFromGOP) already set the correct final shapes
-                # based on final_dim parameter. This is cleaner - worker handles metadata,
-                # model handles image processing.
-                
-                # Remove GOP-related keys as they're no longer needed
-                data.pop('GOP', None)
-                data.pop('video_paths', None)
-                data.pop('video_frame_ids', None)
-        
-        # print("data['img'].shape: ", data['img'].shape)
+        # Handle GOP decode + GPU transforms
+        # Three cases:
+        #   1. enable_gop_decode=True, 'GOP' in data → decode + transform here
+        #   2. enable_gop_decode=True, 'GOP' not in data → prefetch runner
+        #      already decoded & transformed, data['img'] is ready
+        #   3. enable_transform=True (no gop) → GPU transform only
+        if self.enable_gop_decode and 'GOP' in data:
+            self._decode_and_set_img(data)
+        elif self.enable_transform and not self.enable_gop_decode:
+            input_img = data['img'].to(torch.float32)
+            data['img'] = self._apply_gpu_transforms(
+                input_img, data,
+                ida_aug_conf=self.ida_aug_conf,
+                img_norm_cfg=self.img_norm_cfg,
+                global_rot_range=[-0.3925, 0.3925],
+                global_scale_range=[0.95, 1.05],
+                global_trans_std=[0, 0, 0],
+                reverse_angle=True,
+                training=return_loss)
 
         # Continue with normal forward logic
         if return_loss:

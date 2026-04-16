@@ -17,7 +17,7 @@ class_names = [
 
 num_cameras = 6
 num_gpus = 8
-batch_size = 8
+batch_size = 2
 # mini x8: ~320 train samples × 8 = 2560
 num_iters_per_epoch = 2560 // (num_gpus * batch_size)
 num_epochs = 24
@@ -147,7 +147,7 @@ model = dict(
 
 
 dataset_type = 'CustomNuScenesDataset'
-data_root = '/data/nuscenes-mini-x8/stream_petr/'
+data_root = '/data/nuscenes-mini-x8/'
 
 file_client_args = dict(backend='disk')
 
@@ -161,7 +161,13 @@ ida_aug_conf = {
         "rand_flip": True,
     }
 train_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='LoadMultiViewImageFromGOP_demuxer_free',
+        batch_size=batch_size,
+        num_cameras=num_cameras,
+        ida_aug_conf=ida_aug_conf,
+        video_base_path=data_root + "video_samples",
+        gop_base_path=data_root + "video_samples_packets",
+        to_float32=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_bbox=True,
         with_label=True, with_bbox_depth=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
@@ -181,7 +187,13 @@ train_pipeline = [
              meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d','gt_labels_3d'))
 ]
 test_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='LoadMultiViewImageFromGOP_demuxer_free',
+        batch_size=batch_size,
+        num_cameras=num_cameras,
+        ida_aug_conf=ida_aug_conf,
+        video_base_path=data_root + "video_samples",
+        gop_base_path=data_root + "video_samples_packets",
+        to_float32=True),
     dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=False),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
@@ -207,7 +219,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes2d_temporal_infos_train.pkl',
+        ann_file=data_root + 'stream_petr/nuscenes2d_video_temporal_infos_train.pkl',
         num_frame_losses=num_frame_losses,
         seq_split_num=2,
         seq_mode=True,
@@ -222,10 +234,10 @@ data = dict(
         box_type_3d='LiDAR'),
     val=dict(type=dataset_type, pipeline=test_pipeline, collect_keys=collect_keys + ['img', 'img_metas'],
              queue_length=queue_length,
-             ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
+             ann_file=data_root + 'stream_petr/nuscenes2d_video_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
     test=dict(type=dataset_type, pipeline=test_pipeline, collect_keys=collect_keys + ['img', 'img_metas'],
               queue_length=queue_length,
-              ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
+              ann_file=data_root + 'stream_petr/nuscenes2d_video_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
     shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler')
     )

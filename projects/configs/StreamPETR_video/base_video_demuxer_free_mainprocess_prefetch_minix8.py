@@ -6,6 +6,16 @@ backbone_norm_cfg = dict(type='LN', requires_grad=True)
 plugin=True
 plugin_dir='projects/mmdet3d_plugin/'
 
+ida_aug_conf = {
+        "resize_lim": (0.38, 0.55),
+        "final_dim": (256, 704),
+        "bot_pct_lim": (0.0, 0.0),
+        "rot_lim": (0.0, 0.0),
+        "H": 900,
+        "W": 1600,
+        "rand_flip": True,
+    }
+
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size = [0.2, 0.2, 8]
 img_norm_cfg = dict(
@@ -17,7 +27,7 @@ class_names = [
 
 num_cameras = 6
 num_gpus = 8
-batch_size = 4
+batch_size = 2
 # mini x8: ~320 train samples × 8 = 2560
 num_iters_per_epoch = 2560 // (num_gpus * batch_size)
 num_epochs = 24
@@ -37,6 +47,11 @@ model = dict(
     num_frame_backbone_grads=num_frame_losses,
     num_frame_losses=num_frame_losses,
     use_grid_mask=True,
+    enable_gop_decode=True,
+    img_norm_cfg=img_norm_cfg,
+    ida_aug_conf=ida_aug_conf,
+    batch_size=batch_size,
+    num_cameras=num_cameras,
     img_backbone=dict(
         pretrained='torchvision://resnet50',
         type='ResNet',
@@ -147,26 +162,24 @@ model = dict(
 
 
 dataset_type = 'CustomNuScenesDataset'
-data_root = '/data/nuscenes-mini-x8/stream_petr/'
+data_root = '/data/nuscenes-mini-x8/'
 
 file_client_args = dict(backend='disk')
 
-ida_aug_conf = {
-        "resize_lim": (0.38, 0.55),
-        "final_dim": (256, 704),
-        "bot_pct_lim": (0.0, 0.0),
-        "rot_lim": (0.0, 0.0),
-        "H": 900,
-        "W": 1600,
-        "rand_flip": True,
-    }
+
 train_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='LoadMultiViewImageFromGOP_demuxer_free_gop_output',
+        batch_size=batch_size,
+        num_cameras=num_cameras,
+        ida_aug_conf=ida_aug_conf,
+        video_base_path=data_root + "video_samples",
+        gop_base_path=data_root + "video_samples_packets",
+        to_float32=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_bbox=True,
         with_label=True, with_bbox_depth=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
-    dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=True),
+    dict(type='PrepareGPUImageAug', data_aug_conf=ida_aug_conf, training=True),
     dict(type='GlobalRotScaleTransImage',
             rot_range=[-0.3925, 0.3925],
             translation_std=[0, 0, 0],
@@ -174,17 +187,18 @@ train_pipeline = [
             reverse_angle=True,
             training=True,
             ),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='PETRFormatBundle3D', class_names=class_names, collect_keys=collect_keys + ['prev_exists']),
-    dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys,
-             meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d','gt_labels_3d'))
+    dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'GOP', 'video_paths', 'video_frame_ids', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys,
+             meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d', 'gt_labels_3d', 'ida_aug_params'))
 ]
 test_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles', to_float32=True),
-    dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=False),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='LoadMultiViewImageFromGOP_demuxer_free_gop_output',
+        batch_size=batch_size,
+        num_cameras=num_cameras,
+        ida_aug_conf=ida_aug_conf,
+        video_base_path=data_root + "video_samples",
+        gop_base_path=data_root + "video_samples_packets",
+        to_float32=True),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -196,7 +210,7 @@ test_pipeline = [
                 collect_keys=collect_keys,
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['img'] + collect_keys,
+            dict(type='Collect3D', keys=['GOP', 'video_paths', 'video_frame_ids'] + collect_keys,
             meta_keys=('filename', 'ori_shape', 'img_shape','pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token'))
         ])
 ]
@@ -207,25 +221,27 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes2d_temporal_infos_train.pkl',
+        ann_file=data_root + 'stream_petr/nuscenes2d_video_temporal_infos_train.pkl',
         num_frame_losses=num_frame_losses,
         seq_split_num=2,
         seq_mode=True,
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
-        collect_keys=collect_keys + ['img', 'prev_exists', 'img_metas'],
+        collect_keys=collect_keys + ['prev_exists', 'img_metas'],
         queue_length=queue_length,
         test_mode=False,
         use_valid_flag=True,
         filter_empty_gt=False,
         box_type_3d='LiDAR'),
-    val=dict(type=dataset_type, pipeline=test_pipeline, collect_keys=collect_keys + ['img', 'img_metas'],
+    val=dict(type=dataset_type, pipeline=test_pipeline,
+             collect_keys=collect_keys + ['img_metas'],
              queue_length=queue_length,
-             ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
-    test=dict(type=dataset_type, pipeline=test_pipeline, collect_keys=collect_keys + ['img', 'img_metas'],
+             ann_file=data_root + 'stream_petr/nuscenes2d_video_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
+    test=dict(type=dataset_type, pipeline=test_pipeline,
+              collect_keys=collect_keys + ['img_metas'],
               queue_length=queue_length,
-              ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
+              ann_file=data_root + 'stream_petr/nuscenes2d_video_temporal_infos_val.pkl', classes=class_names, modality=input_modality),
     shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler')
     )
@@ -256,6 +272,6 @@ log_config = dict(
 evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
 find_unused_parameters=False
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=3)
-runner = dict(type='IterBasedRunner', max_iters=200)
+runner = dict(type='IterBasedRunnerWithPrefetch', max_iters=200)
 load_from=None
 resume_from=None

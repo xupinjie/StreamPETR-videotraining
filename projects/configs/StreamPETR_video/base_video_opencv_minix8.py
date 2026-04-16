@@ -16,8 +16,8 @@ class_names = [
 ]
 
 num_cameras = 6
-num_gpus = 4
-batch_size = 8
+num_gpus = 8
+batch_size = 2
 # mini x8: ~320 train samples × 8 = 2560
 num_iters_per_epoch = 2560 // (num_gpus * batch_size)
 num_epochs = 24
@@ -161,7 +161,7 @@ ida_aug_conf = {
         "rand_flip": True,
     }
 train_pipeline = [
-    dict(type='LoadMultiViewImageFromVideo_stream_access', batch_size=batch_size, num_cameras=num_cameras, ida_aug_conf=ida_aug_conf, to_float32=True),
+    dict(type='LoadMultiViewImageFromVideo_opencv', batch_size=batch_size, num_cameras=num_cameras, ida_aug_conf=ida_aug_conf, to_float32=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_bbox=True,
         with_label=True, with_bbox_depth=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
@@ -181,7 +181,7 @@ train_pipeline = [
              meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d','gt_labels_3d'))
 ]
 test_pipeline = [
-    dict(type='LoadMultiViewImageFromVideo_stream_access', batch_size=batch_size, num_cameras=num_cameras, ida_aug_conf=ida_aug_conf, to_float32=True),
+    dict(type='LoadMultiViewImageFromVideo_opencv', batch_size=batch_size, num_cameras=num_cameras, ida_aug_conf=ida_aug_conf, to_float32=True),
     dict(type='ResizeCropFlipRotImage', data_aug_conf=ida_aug_conf, training=False),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
